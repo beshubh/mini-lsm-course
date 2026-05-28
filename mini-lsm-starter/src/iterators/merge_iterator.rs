@@ -59,7 +59,20 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        let mut heap = BinaryHeap::new();
+        for (idx, iter) in iters.into_iter().enumerate() {
+            if iter.is_valid() {
+                heap.push(HeapWrapper(idx, iter));
+            }
+        }
+        let first = match heap.len() {
+            0 => None,
+            _ => heap.pop(),
+        };
+        Self {
+            iters: heap,
+            current: first,
+        }
     }
 }
 
@@ -69,18 +82,43 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        match self.current.as_ref() {
+            None => KeySlice::from_slice(&[]),
+            Some(item) => item.1.key(),
+        }
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        match self.current.as_ref() {
+            None => &[],
+            Some(item) => item.1.value(),
+        }
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.current.as_ref().is_some_and(|x| x.1.is_valid())
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let mut current = self.current.take().unwrap();
+        let current_key = current.1.key().to_key_vec();
+        current.1.next()?; // NOTE: this error needs to be handlede manually
+
+        if current.1.is_valid() {
+            self.iters.push(current);
+        }
+        while let Some(mut top) = self.iters.pop() {
+            // Skip all the older keys, because latest one is the lates value.
+            if top.1.key() != current_key.as_key_slice() {
+                self.current = Some(top);
+                return Ok(());
+            }
+            top.1.next()?;
+            if top.1.is_valid() {
+                self.iters.push(top);
+            }
+        }
+        self.current = None;
+        Ok(())
     }
 }

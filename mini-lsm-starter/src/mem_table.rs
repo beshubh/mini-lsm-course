@@ -20,15 +20,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+use crate::iterators::StorageIterator;
+use crate::key::{Key, KeySlice};
+use crate::table::SsTableBuilder;
+use crate::wal::Wal;
 use anyhow::Result;
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
-
-use crate::iterators::StorageIterator;
-use crate::key::KeySlice;
-use crate::table::SsTableBuilder;
-use crate::wal::Wal;
 
 /// A basic mem-table based on crossbeam-skiplist (sorted map)
 ///
@@ -130,8 +129,16 @@ impl MemTable {
     }
 
     /// Get an iterator over a range of keys.
-    pub fn scan(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> MemTableIterator {
-        unimplemented!()
+    pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> MemTableIterator {
+        let mut iter = MemTableIteratorBuilder {
+            map: self.map.clone(),
+            iter_builder: |mp| mp.range((map_bound(lower), map_bound(upper))),
+            item: (Bytes::new(), Bytes::new()),
+            state_valid: true,
+        }
+        .build();
+        iter.next().unwrap();
+        iter
     }
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
@@ -171,24 +178,32 @@ pub struct MemTableIterator {
     iter: SkipMapRangeIter<'this>,
     /// Stores the current key-value pair.
     item: (Bytes, Bytes),
+    state_valid: bool,
 }
 
 impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.with_item(|item| item.1.as_ref())
     }
 
     fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        self.with_item(|item| KeySlice::from_slice(item.0.as_ref()))
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        *self.with_state_valid(|state_valid| state_valid)
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.with_mut(|fields| match fields.iter.next() {
+            Some(entry) => {
+                *fields.item = (entry.key().clone(), entry.value().clone());
+                *fields.state_valid = true;
+            }
+            None => *fields.state_valid = false,
+        });
+        Ok(())
     }
 }
