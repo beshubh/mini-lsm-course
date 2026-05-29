@@ -100,7 +100,7 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     }
 
     fn next(&mut self) -> Result<()> {
-        let mut current = self.current.take().unwrap();
+        let mut current = self.current.take().unwrap(); // Log (K)
         let current_key = current.1.key().to_key_vec();
         current.1.next()?; // NOTE: this error needs to be handlede manually
 
@@ -108,6 +108,7 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
             self.iters.push(current);
         }
         while let Some(mut top) = self.iters.pop() {
+            // Log (K)
             // Skip all the older keys, because latest one is the lates value.
             if top.1.key() != current_key.as_key_slice() {
                 self.current = Some(top);

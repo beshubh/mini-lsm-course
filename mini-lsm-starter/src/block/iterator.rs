@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::sync::Arc;
 
 use crate::key::{KeySlice, KeyVec};
@@ -46,46 +43,103 @@ impl BlockIterator {
         }
     }
 
+    fn clear(&mut self) {
+        self.key.clear();
+        self.value_range = (0, 0);
+        self.idx = self.block.offsets.len();
+    }
+
+    fn key_at_idx(&self, idx: usize) -> KeySlice<'_> {
+        let mut pos = self.block.offsets[idx] as usize;
+        let keylen = u16::from_be_bytes([self.block.data[pos], self.block.data[pos + 1]]) as usize;
+        pos += 2;
+        KeySlice::from_slice(&self.block.data[pos..pos + keylen])
+    }
+
+    fn seek_to_idx(&mut self, idx: usize) {
+        if idx >= self.block.offsets.len() {
+            self.clear();
+            return;
+        }
+
+        let mut pos = self.block.offsets[idx] as usize;
+        let keylen = u16::from_be_bytes([self.block.data[pos], self.block.data[pos + 1]]) as usize;
+        pos += 2;
+        let key = KeyVec::from_vec(self.block.data[pos..pos + keylen].to_vec());
+        pos += keylen;
+        let valuelen =
+            u16::from_be_bytes([self.block.data[pos], self.block.data[pos + 1]]) as usize;
+        pos += 2;
+        let value_start = pos;
+        let value_end = pos + valuelen;
+
+        self.key = key;
+        self.idx = idx;
+        self.value_range = (value_start, value_end);
+    }
+
     /// Creates a block iterator and seek to the first entry.
     pub fn create_and_seek_to_first(block: Arc<Block>) -> Self {
-        unimplemented!()
+        let mut iter = Self::new(block);
+        iter.seek_to_first();
+        iter
     }
 
     /// Creates a block iterator and seek to the first key that >= `key`.
     pub fn create_and_seek_to_key(block: Arc<Block>, key: KeySlice) -> Self {
-        unimplemented!()
+        let mut iter = Self::new(block);
+        iter.seek_to_key(key);
+        iter
     }
 
     /// Returns the key of the current entry.
     pub fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        self.key.as_key_slice()
     }
 
     /// Returns the value of the current entry.
     pub fn value(&self) -> &[u8] {
-        unimplemented!()
+        &self.block.data[self.value_range.0..self.value_range.1]
     }
 
     /// Returns true if the iterator is valid.
     /// Note: You may want to make use of `key`
     pub fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.key().is_empty()
     }
 
     /// Seeks to the first key in the block.
     pub fn seek_to_first(&mut self) {
-        unimplemented!()
+        if self.block.offsets.is_empty() {
+            self.clear();
+            return;
+        }
+
+        self.seek_to_idx(0);
+        self.first_key = self.key.clone();
     }
 
     /// Move to the next key in the block.
     pub fn next(&mut self) {
-        unimplemented!()
+        self.seek_to_idx(self.idx + 1);
     }
 
     /// Seek to the first key that >= `key`.
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
-        unimplemented!()
+        let mut left = 0;
+        let mut right = self.block.offsets.len();
+
+        while left < right {
+            let mid = (left + right) / 2;
+            if self.key_at_idx(mid) < key {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+
+        self.seek_to_idx(left);
     }
 }
