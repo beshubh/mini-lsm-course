@@ -31,6 +31,7 @@ pub struct BlockBuilder {
     block_size: usize,
     /// The first key in the block
     first_key: KeyVec,
+    last_key: KeyVec,
 }
 
 impl BlockBuilder {
@@ -41,6 +42,7 @@ impl BlockBuilder {
             data: vec![],
             block_size,
             first_key: KeyVec::new(),
+            last_key: KeyVec::new(),
         }
     }
 
@@ -80,6 +82,8 @@ impl BlockBuilder {
         self.data.put_u16(valuelen);
         self.data.put_slice(value);
         self.offsets.push(keyoffset);
+
+        self.last_key.set_from_slice(key);
         true
     }
 
@@ -94,5 +98,17 @@ impl BlockBuilder {
             data: self.data,
             offsets: self.offsets,
         }
+    }
+
+    pub fn first_key(&self) -> KeyVec {
+        self.first_key.clone()
+    }
+
+    pub fn last_key(&self) -> KeyVec {
+        self.last_key.clone()
+    }
+
+    pub fn estimated_size(&self) -> usize {
+        self.data.len()
     }
 }

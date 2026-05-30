@@ -23,9 +23,10 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 pub use builder::SsTableBuilder;
-use bytes::Buf;
+use bytes::Bytes;
+use bytes::{Buf, BufMut};
 pub use iterator::SsTableIterator;
 
 use crate::block::Block;
@@ -46,19 +47,68 @@ pub struct BlockMeta {
 
 impl BlockMeta {
     /// Encode block meta to a buffer.
+    ///
+    /// ASCII layout of the encoded `BlockMeta` section:
+    ///
+    /// ```text
+    /// +-------------------------------------------------------------------------------+
+    /// |                           num_block_metas (u32)                               |
+    /// +-------------------------------------------------------------------------------+
+    /// +--------------------------- repeated for each block ---------------------------+
+    /// | offset (u32) | first_key_len (u16) | first_key | last_key_len (u16) | last_key |
+    /// +-------------------------------------------------------------------------------+
+    /// |                           ... repeated `block_meta.len()` times ...           |
+    /// +-------------------------------------------------------------------------------+
+    /// ```
+    ///
+    /// All integer fields are encoded in big-endian order.
     /// You may add extra fields to the buffer,
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
-    pub fn encode_block_meta(
-        block_meta: &[BlockMeta],
-        #[allow(clippy::ptr_arg)] // remove this allow after you finish
-        buf: &mut Vec<u8>,
-    ) {
-        unimplemented!()
+    pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>) {
+        buf.put_u32(block_meta.len().try_into().unwrap());
+        for bm in block_meta {
+            buf.put_u32(bm.offset as u32);
+            buf.put_u16(bm.first_key.len().try_into().unwrap());
+            buf.put_slice(bm.first_key.raw_ref());
+            buf.put_u16(bm.last_key.len().try_into().unwrap());
+            buf.put_slice(bm.last_key.raw_ref());
+        }
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(buf: impl Buf) -> Vec<BlockMeta> {
-        unimplemented!()
+    pub fn decode_block_meta(mut buf: impl Buf) -> Vec<BlockMeta> {
+        assert!(
+            buf.remaining() >= 4,
+            "block meta buffer too small to contain metadata count"
+        );
+        let num_block_metas = buf.get_u32() as usize;
+        let mut metas = Vec::with_capacity(num_block_metas);
+        for _ in 0..num_block_metas {
+            assert!(buf.remaining() >= 4, "missing block offset");
+            let offset = buf.get_u32();
+            assert!(buf.remaining() >= 2, "missing first key length");
+            let first_key_len = buf.get_u16() as usize;
+            assert!(
+                buf.remaining() >= first_key_len,
+                "first key length exceeds remaining buffer"
+            );
+            let first_key = buf.copy_to_bytes(first_key_len).to_vec();
+
+            assert!(buf.remaining() >= 2, "missing last key length");
+            let last_key_len = buf.get_u16() as usize;
+
+            assert!(
+                buf.remaining() >= last_key_len,
+                "last key length exceeds remaining buffer"
+            );
+            let last_key = buf.copy_to_bytes(last_key_len).to_vec();
+            metas.push(BlockMeta {
+                offset: offset as usize,
+                first_key: KeyBytes::from_bytes(Bytes::from(first_key)),
+                last_key: KeyBytes::from_bytes(Bytes::from(last_key)),
+            });
+        }
+        metas
     }
 }
 
@@ -122,7 +172,48 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        unimplemented!()
+        let file_size = file.size();
+        if file_size < 4 {
+            bail!("sst file is too small to contain metadata footer");
+        }
+
+        let footer = file.read(file_size - 4, 4)?;
+        let block_meta_offset = u32::from_be_bytes(footer[..4].try_into().unwrap()) as usize;
+
+        if block_meta_offset + 4 > file_size as usize {
+            bail!("invalid block meta offset in sst file");
+        }
+
+        let meta_bytes = file.read(
+            block_meta_offset as u64,
+            file_size - block_meta_offset as u64 - 4,
+        )?;
+        let block_meta = BlockMeta::decode_block_meta(&meta_bytes[..]);
+        let Some(first_meta) = block_meta.first() else {
+            bail!("sst file does not contain any block metadata");
+        };
+        let Some(last_meta) = block_meta.last() else {
+            bail!("sst file does not contain any block metadata");
+        };
+
+        let first_key = first_meta.first_key.clone();
+        let last_key = last_meta.last_key.clone();
+
+        if (file_size as usize) < block_meta_offset {
+            bail!("invalid block meta offset in sst file");
+        }
+
+        Ok(Self {
+            file,
+            block_meta,
+            block_meta_offset,
+            id,
+            block_cache,
+            first_key,
+            last_key,
+            bloom: None,
+            max_ts: 0,
+        })
     }
 
     /// Create a mock SST with only first key + last key metadata
