@@ -18,6 +18,42 @@ use crate::key::{KeySlice, KeyVec};
 
 use super::Block;
 
+/// Block encoding layout (on-disk):
+///
+/// ```text
+/// ┌──────────────────────────────────────────────────────────────┐
+/// │                        Key-Value Entries                     │
+/// │                                                              │
+/// │  Entry 0: ┌──────┬─────────┬────────┬──────────┐            │
+/// │           │keylen│   key   │valuelen│   value  │            │
+/// │           │u16 BE│keylen B │ u16 BE │valuelen B│            │
+/// │           └──────┴─────────┴────────┴──────────┘            │
+/// │  Entry 1: ┌──────┬─────────┬────────┬──────────┐            │
+/// │           │keylen│   key   │valuelen│   value  │            │
+/// │           │u16 BE│keylen B │ u16 BE │valuelen B│            │
+/// │           └──────┴─────────┴────────┴──────────┘            │
+/// │  ...                                                         │
+/// │                                                              │
+/// ├──────────────────────────────────────────────────────────────┤
+/// │                      Offset Array                            │
+/// │  [offset_0 (u16), offset_1 (u16), ..., offset_n-1 (u16)]    │
+/// │  (each u16 points to the start of the corresponding entry)   │
+/// ├──────────────────────────────────────────────────────────────┤
+/// │  num_offsets (u16 BE) — number of key-value entries          │
+/// └──────────────────────────────────────────────────────────────┘
+/// ```
+///
+/// Key-value entry encoding within the data section:
+///
+/// ```text
+/// ┌──────────┬──────────────────────┬──────────┬──────────────────┐
+/// │ keylen   │ key content          │ valuelen │ value content    │
+/// │ (2 bytes)│ (keylen bytes)       │ (2 bytes)│ (valuelen bytes) │
+/// └──────────┴──────────────────────┴──────────┴──────────────────┘
+///   ↑                                                            ↑
+///   offset for this entry points here                             end of entry
+/// ```
+
 /// Iterates on a block.
 pub struct BlockIterator {
     /// The internal `Block`, wrapped by an `Arc`
@@ -33,7 +69,7 @@ pub struct BlockIterator {
 }
 
 impl BlockIterator {
-    fn new(block: Arc<Block>) -> Self {
+    pub fn new(block: Arc<Block>) -> Self {
         Self {
             block,
             key: KeyVec::new(),
@@ -127,13 +163,13 @@ impl BlockIterator {
     /// Seek to the first key that >= `key`.
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
-    pub fn seek_to_key(&mut self, key: KeySlice) {
+    pub fn seek_to_key(&mut self, target: KeySlice) {
         let mut left = 0;
         let mut right = self.block.offsets.len();
 
         while left < right {
             let mid = (left + right) / 2;
-            if self.key_at_idx(mid) < key {
+            if self.key_at_idx(mid) < target {
                 left = mid + 1;
             } else {
                 right = mid;

@@ -238,7 +238,18 @@ impl SsTable {
 
     /// Read a block from the disk.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        if block_idx >= self.block_meta.len() {
+            bail!("`block_idx` exceeds the blocks that we have in this SsTable");
+        }
+        let block_meta = &self.block_meta[block_idx];
+        let block_len = if block_idx + 1 < self.block_meta.len() {
+            self.block_meta[block_idx + 1].offset - block_meta.offset
+        } else {
+            self.block_meta_offset - block_meta.offset
+        };
+        let data = self.file.read(block_meta.offset as u64, block_len as u64)?;
+        let block = Block::decode(&data);
+        Ok(Arc::new(block))
     }
 
     /// Read a block from disk, with block cache. (Day 4)
