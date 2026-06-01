@@ -254,7 +254,26 @@ impl SsTable {
 
     /// Read a block from disk, with block cache. (Day 4)
     pub fn read_block_cached(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        // read from cache
+        // if does not exists query the disk.
+        // populate the cache and return.
+        // make sure that multiple requests to the same block_idx are coalesced together and only one thread queries disk and populates cache.
+        let Some(block_cache) = &self.block_cache else {
+            return self.read_block(block_idx);
+        };
+        let block_cache = block_cache.clone();
+        let key = (self.id, block_idx);
+        let result = block_cache.try_get_with(key, || self.read_block(block_idx));
+        match result {
+            Ok(block) => Ok(block),
+            Err(e) => {
+                eprintln!("error fetching from disk: {:#}", e);
+                Err(anyhow::anyhow!(
+                    "block cache error fetching from dis: {}",
+                    e
+                ))
+            }
+        }
     }
 
     /// Find the block that may contain `key`.

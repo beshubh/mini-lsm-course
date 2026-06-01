@@ -35,7 +35,7 @@ impl SsTableIterator {
         let Some(first_block_meta) = table.block_meta.first() else {
             bail!("Block meta's does not contain anything");
         };
-        let block = table.read_block(0)?;
+        let block = table.read_block_cached(0)?;
         let mut block_iter = BlockIterator::new(block);
         block_iter.seek_to_first();
         let mut itr = SsTableIterator {
@@ -49,7 +49,7 @@ impl SsTableIterator {
 
     /// Seek to the first key-value pair in the first data block.
     pub fn seek_to_first(&mut self) -> Result<()> {
-        let block = self.table.read_block(0)?;
+        let block = self.table.read_block_cached(0)?;
         self.blk_iter = BlockIterator::new(block);
         self.blk_iter.seek_to_first();
         self.blk_idx = 0;
@@ -103,7 +103,7 @@ impl SsTableIterator {
     pub fn seek_to_idx(&mut self, idx: usize) -> Result<()> {
         let block_meta = &self.table.block_meta[idx];
         self.blk_idx = idx;
-        let block = self.table.read_block(idx)?;
+        let block = self.table.read_block_cached(idx)?;
         self.blk_iter = BlockIterator::new(block);
         self.blk_iter.seek_to_first();
         Ok(())
