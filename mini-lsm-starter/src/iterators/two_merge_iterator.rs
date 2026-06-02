@@ -25,6 +25,8 @@ pub struct TwoMergeIterator<A: StorageIterator, B: StorageIterator> {
     a: A,
     b: B,
     // Add fields as need
+    current_a: bool,
+    both_invalid: bool,
 }
 
 impl<
@@ -33,7 +35,21 @@ impl<
 > TwoMergeIterator<A, B>
 {
     pub fn create(a: A, b: B) -> Result<Self> {
-        unimplemented!()
+        let mut current_a = false;
+        if a.is_valid() && b.is_valid() {
+            if a.key() <= b.key() {
+                current_a = true;
+            }
+        } else if a.is_valid() {
+            current_a = true;
+        }
+        println!("DEBUG: two merge new, current_a: {}", current_a);
+        Ok(Self {
+            a,
+            b,
+            current_a,
+            both_invalid: false,
+        })
     }
 }
 
@@ -45,18 +61,63 @@ impl<
     type KeyType<'a> = A::KeyType<'a>;
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        if self.current_a {
+            self.a.key()
+        } else {
+            self.b.key()
+        }
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        if self.current_a {
+            self.a.value()
+        } else {
+            self.b.value()
+        }
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        if self.both_invalid {
+            return false;
+        }
+        if self.current_a {
+            self.a.is_valid()
+        } else {
+            self.b.is_valid()
+        }
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if self.current_a {
+            self.a.next()?;
+            // skip all the elments from b that are less than a
+            while self.a.is_valid() && self.b.is_valid() && self.a.key() >= self.b.key() {
+                self.b.next()?;
+            }
+        } else {
+            self.b.next()?;
+            while self.b.is_valid() && self.a.is_valid() && self.b.key() > self.a.key() {
+                self.a.next()?;
+            }
+        }
+
+        if !self.a.is_valid() && !self.b.is_valid() {
+            self.both_invalid = true;
+            return Ok(());
+        }
+        if self.a.is_valid() && self.b.is_valid() {
+            if self.a.key() <= self.b.key() {
+                self.current_a = true;
+            } else {
+                self.current_a = false;
+            }
+        } else if self.a.is_valid() {
+            self.current_a = true;
+        } else {
+            self.current_a = false;
+        }
+
+        println!("DEBUG: two merge next(), current_a: {}", self.current_a);
+        Ok(())
     }
 }
