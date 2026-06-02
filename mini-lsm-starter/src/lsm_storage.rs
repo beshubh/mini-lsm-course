@@ -307,8 +307,8 @@ impl LsmStorageInner {
             let guard = self.state.read();
             Arc::clone(&guard)
         };
+        // scan the current memtable
         let val = state.memtable.get(key);
-
         if val.is_some() {
             // TOMBSTONE check
             let v = val.as_ref().unwrap();
@@ -317,6 +317,7 @@ impl LsmStorageInner {
             }
             return Ok(val);
         }
+        // Scan frozen memtables
         for memtable in state.imm_memtables.iter() {
             let val = memtable.get(key);
 
@@ -327,6 +328,19 @@ impl LsmStorageInner {
                     return Ok(None);
                 }
                 return Ok(val);
+            }
+        }
+
+        // Scan SsTable
+        let sst_iters = self.create_sst_iters(Bound::Included(key), state)?;
+        let key_slice = KeySlice::from_slice(key);
+        for sst_iter in &sst_iters {
+            if sst_iter.key() == key_slice {
+                let val = sst_iter.value();
+                if val.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(Bytes::copy_from_slice(val)));
             }
         }
         Ok(None)
@@ -423,6 +437,37 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    fn create_sst_iters(
+        &self,
+        seek_key: Bound<&[u8]>,
+        snapshot: Arc<LsmStorageState>,
+    ) -> Result<Vec<Box<SsTableIterator>>> {
+        let mut sst_iters = vec![];
+        for sst_id in &snapshot.l0_sstables {
+            let table = Arc::new(SsTable::open(
+                *sst_id,
+                Some(Arc::clone(&self.block_cache)),
+                FileObject::open(&self.path.join(format!("{}.sst", sst_id)))
+                    .context(format!("Error opening the sst file: {}.sst", sst_id))?,
+            )?);
+            let mut sst_iter = match seek_key {
+                Bound::Included(key) | Bound::Excluded(key) => {
+                    SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(key))?
+                }
+                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(table)?,
+            };
+
+            if let Bound::Excluded(key) = seek_key {
+                if sst_iter.is_valid() && sst_iter.key().raw_ref() == key {
+                    sst_iter.next()?;
+                }
+            }
+
+            sst_iters.push(Box::new(sst_iter));
+        }
+        Ok(sst_iters)
+    }
+
     /// Create an iterator over a range of keys.
     pub fn scan(
         &self,
@@ -438,29 +483,7 @@ impl LsmStorageInner {
         snapshot.imm_memtables.iter().for_each(|imm| {
             memtables.push(Box::new(imm.scan(lower, upper)));
         });
-        let mut sst_iters = vec![];
-        for sst_id in &snapshot.l0_sstables {
-            let table = Arc::new(SsTable::open(
-                *sst_id,
-                Some(Arc::clone(&self.block_cache)),
-                FileObject::open(&self.path.join(format!("{}.sst", sst_id)))
-                    .context(format!("Error opening the sst file: {}.sst", sst_id))?,
-            )?);
-            let mut sst_iter = match lower {
-                Bound::Included(key) | Bound::Excluded(key) => {
-                    SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(key))?
-                }
-                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(table)?,
-            };
-
-            if let Bound::Excluded(key) = lower {
-                if sst_iter.is_valid() && sst_iter.key().raw_ref() == key {
-                    sst_iter.next()?;
-                }
-            }
-
-            sst_iters.push(Box::new(sst_iter));
-        }
+        let sst_iters = self.create_sst_iters(lower, snapshot)?;
         let mem_merge_iters = MergeIterator::create(memtables);
         let sst_merge_iters = MergeIterator::create(sst_iters);
         let inner = TwoMergeIterator::create(mem_merge_iters, sst_merge_iters)?;
