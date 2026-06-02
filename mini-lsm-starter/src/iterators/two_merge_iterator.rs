@@ -43,7 +43,6 @@ impl<
         } else if a.is_valid() {
             current_a = true;
         }
-        println!("DEBUG: two merge new, current_a: {}", current_a);
         Ok(Self {
             a,
             b,
@@ -117,7 +116,6 @@ impl<
             self.current_a = false;
         }
 
-        println!("DEBUG: two merge next(), current_a: {}", self.current_a);
         Ok(())
     }
 }

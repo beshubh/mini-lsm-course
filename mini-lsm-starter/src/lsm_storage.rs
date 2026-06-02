@@ -15,15 +15,15 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use crate::iterators::StorageIterator;
+use crate::key::KeySlice;
 use std::collections::HashMap;
-use std::mem;
 use std::ops::Bound;
-use std::os::macos::raw::stat;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -33,11 +33,12 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{FileObject, SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -428,16 +429,42 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        let state = {
+        let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
         };
         let mut memtables = vec![];
-        memtables.push(Box::new(state.memtable.scan(lower, upper)));
-        state.imm_memtables.iter().for_each(|imm| {
+        memtables.push(Box::new(snapshot.memtable.scan(lower, upper)));
+        snapshot.imm_memtables.iter().for_each(|imm| {
             memtables.push(Box::new(imm.scan(lower, upper)));
         });
-        let iter = LsmIterator::new(MergeIterator::create(memtables))?;
+        let mut sst_iters = vec![];
+        for sst_id in &snapshot.l0_sstables {
+            let table = Arc::new(SsTable::open(
+                *sst_id,
+                Some(Arc::clone(&self.block_cache)),
+                FileObject::open(&self.path.join(format!("{}.sst", sst_id)))
+                    .context(format!("Error opening the sst file: {}.sst", sst_id))?,
+            )?);
+            let mut sst_iter = match lower {
+                Bound::Included(key) | Bound::Excluded(key) => {
+                    SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(key))?
+                }
+                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(table)?,
+            };
+
+            if let Bound::Excluded(key) = lower {
+                if sst_iter.is_valid() && sst_iter.key().raw_ref() == key {
+                    sst_iter.next()?;
+                }
+            }
+
+            sst_iters.push(Box::new(sst_iter));
+        }
+        let mem_merge_iters = MergeIterator::create(memtables);
+        let sst_merge_iters = MergeIterator::create(sst_iters);
+        let inner = TwoMergeIterator::create(mem_merge_iters, sst_merge_iters)?;
+        let iter = LsmIterator::new(inner, map_bound(upper).clone())?;
         Ok(FusedIterator::new(iter))
     }
 }

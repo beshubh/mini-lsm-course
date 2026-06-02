@@ -15,24 +15,48 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use bytes::Bytes;
+use std::ops::Bound;
+
 use anyhow::Result;
 
 use crate::{
-    iterators::{StorageIterator, merge_iterator::MergeIterator},
+    iterators::{
+        StorageIterator, merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator,
+    },
     mem_table::MemTableIterator,
+    table::SsTableIterator,
 };
 
+fn is_past_upper_bound(upper_bound: &Bound<Bytes>, value: &[u8]) -> bool {
+    match upper_bound.as_ref() {
+        Bound::Included(b) => value > b.as_ref(),
+        Bound::Excluded(b) => value >= b.as_ref(),
+        Bound::Unbounded => false,
+    }
+}
+
 /// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
-type LsmIteratorInner = MergeIterator<MemTableIterator>;
+type LsmIteratorInner =
+    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
+    end_bound: Bound<Bytes>,
+    stopped: bool,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner) -> Result<Self> {
-        let mut obj = Self { inner: iter };
+    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
+        let mut obj = Self {
+            inner: iter,
+            end_bound: end_bound.clone(),
+            stopped: false,
+        };
         obj.skip_tombstones()?;
+        if obj.is_valid() && is_past_upper_bound(&end_bound, obj.key()) {
+            obj.stopped = true;
+        }
         Ok(obj)
     }
 
@@ -48,7 +72,7 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        self.inner.is_valid()
+        self.inner.is_valid() && !self.stopped
     }
 
     fn key(&self) -> &[u8] {
@@ -60,8 +84,15 @@ impl StorageIterator for LsmIterator {
     }
 
     fn next(&mut self) -> Result<()> {
+        if self.stopped {
+            return Ok(());
+        }
         self.inner.next()?;
-        self.skip_tombstones()
+        self.skip_tombstones()?;
+        if self.is_valid() && is_past_upper_bound(&self.end_bound, self.key()) {
+            self.stopped = true
+        }
+        Ok(())
     }
 }
 
@@ -113,6 +144,7 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         let res = self.iter.next();
         match res {
             Ok(_) => Ok(()),
+
             Err(e) => {
                 self.has_errored = true;
                 Err(e)
