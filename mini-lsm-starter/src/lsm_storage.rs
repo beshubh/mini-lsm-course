@@ -38,7 +38,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{FileObject, SsTable, SsTableIterator};
+use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -173,7 +173,14 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        let handle = {
+            let mut guard = self.flush_thread.lock();
+            guard.take()
+        };
+        if let Some(handle) = handle {
+            handle.join().expect("flush thread panicked.");
+        }
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -429,7 +436,29 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        // Select the last memtable from imm_memtable.
+        // create sst file corresponding to a memtable
+        // Remove the memtable from imm_memtable
+        let _state_lock = self.state_lock.lock();
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+
+        let Some(last_memtable) = snapshot.imm_memtables.last() else {
+            return Ok(());
+        };
+        let path = self.path.join(format!("{}.sst", last_memtable.id()));
+        let sst = last_memtable.flush(SsTableBuilder::new(self.options.block_size), &path)?;
+        {
+            let mut state_guard = self.state.write(); // we cannot afford to block here for very long time
+            // replace the old state with new is just shifting pointers and not that expensive here
+            let mut new_state = (**state_guard).clone();
+            new_state.imm_memtables.pop(); // O(1) operation, cheap
+            new_state.l0_sstables.insert(0, sst.sst_id()); // O(len(l0_sstables)), not that expensive
+            *state_guard = Arc::new(new_state); // O(1) operation
+        } // write guard droppped.
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {

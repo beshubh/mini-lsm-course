@@ -106,7 +106,7 @@ impl SsTableBuilder {
 
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to manipulate the disk objects.
     pub fn build(
-        #[allow(unused_mut)] mut self,
+        mut self,
         id: usize,
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
@@ -126,7 +126,7 @@ impl SsTableBuilder {
         Ok(SsTable {
             file: FileObject::open(path.as_ref())?,
             block_meta_offset: meta_offset as usize,
-            block_meta: self.meta,
+            block_meta: self.meta.clone(),
             first_key: KeyBytes::from_bytes(Bytes::from(self.first_key)),
             last_key: KeyBytes::from_bytes(Bytes::from(self.last_key)),
             block_cache,
