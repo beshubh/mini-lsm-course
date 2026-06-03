@@ -25,6 +25,7 @@ use std::sync::atomic::AtomicUsize;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use nom::character::streaming::tab;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::block::Block;
@@ -339,7 +340,7 @@ impl LsmStorageInner {
         }
 
         // Scan SsTable
-        let sst_iters = self.create_sst_iters(Bound::Included(key), state)?;
+        let sst_iters = self.create_sst_iters(Bound::Included(key), Bound::Included(key), state)?;
         let key_slice = KeySlice::from_slice(key);
         for sst_iter in &sst_iters {
             if sst_iter.key() == key_slice {
@@ -449,13 +450,19 @@ impl LsmStorageInner {
             return Ok(());
         };
         let path = self.path.join(format!("{}.sst", last_memtable.id()));
-        let sst = last_memtable.flush(SsTableBuilder::new(self.options.block_size), &path)?;
+        let block_cache = self.block_cache.clone();
+        let sst = last_memtable.flush(
+            SsTableBuilder::new(self.options.block_size),
+            block_cache,
+            &path,
+        )?;
         {
             let mut state_guard = self.state.write(); // we cannot afford to block here for very long time
             // replace the old state with new is just shifting pointers and not that expensive here
             let mut new_state = (**state_guard).clone();
             new_state.imm_memtables.pop(); // O(1) operation, cheap
             new_state.l0_sstables.insert(0, sst.sst_id()); // O(len(l0_sstables)), not that expensive
+            new_state.sstables.insert(sst.sst_id(), Arc::new(sst));
             *state_guard = Arc::new(new_state); // O(1) operation
         } // write guard droppped.
         Ok(())
@@ -468,25 +475,52 @@ impl LsmStorageInner {
 
     fn create_sst_iters(
         &self,
-        seek_key: Bound<&[u8]>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
         snapshot: Arc<LsmStorageState>,
     ) -> Result<Vec<Box<SsTableIterator>>> {
         let mut sst_iters = vec![];
         for sst_id in &snapshot.l0_sstables {
-            let table = Arc::new(SsTable::open(
-                *sst_id,
-                Some(Arc::clone(&self.block_cache)),
-                FileObject::open(&self.path.join(format!("{}.sst", sst_id)))
-                    .context(format!("Error opening the sst file: {}.sst", sst_id))?,
-            )?);
-            let mut sst_iter = match seek_key {
+            // let table = Arc::new(SsTable::open(
+            //     *sst_id,
+            //     Some(Arc::clone(&self.block_cache)),
+            //     FileObject::open(&self.path.join(format!("{}.sst", sst_id)))
+            //         .context(format!("Error opening the sst file: {}.sst", sst_id))?,
+            // )?);
+            let Some(table) = snapshot.sstables.get(sst_id) else {
+                continue;
+            };
+            let table = table.clone();
+            let first_key = table.first_key().raw_ref();
+            let last_key = table.last_key().raw_ref();
+
+            let skip_for_lower = match lower {
+                Bound::Included(target) => last_key < target,
+                Bound::Excluded(target) => last_key <= target,
+                Bound::Unbounded => false,
+            };
+            if skip_for_lower {
+                continue;
+            }
+
+            let skip_for_upper = match upper {
+                Bound::Included(target) => first_key > target,
+                Bound::Excluded(target) => first_key >= target,
+                Bound::Unbounded => false,
+            };
+
+            if skip_for_upper {
+                continue;
+            }
+
+            let mut sst_iter = match lower {
                 Bound::Included(key) | Bound::Excluded(key) => {
                     SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(key))?
                 }
                 Bound::Unbounded => SsTableIterator::create_and_seek_to_first(table)?,
             };
 
-            if let Bound::Excluded(key) = seek_key {
+            if let Bound::Excluded(key) = lower {
                 if sst_iter.is_valid() && sst_iter.key().raw_ref() == key {
                     sst_iter.next()?;
                 }
@@ -512,7 +546,7 @@ impl LsmStorageInner {
         snapshot.imm_memtables.iter().for_each(|imm| {
             memtables.push(Box::new(imm.scan(lower, upper)));
         });
-        let sst_iters = self.create_sst_iters(lower, snapshot)?;
+        let sst_iters = self.create_sst_iters(lower, upper, snapshot)?;
         let mem_merge_iters = MergeIterator::create(memtables);
         let sst_merge_iters = MergeIterator::create(sst_iters);
         let inner = TwoMergeIterator::create(mem_merge_iters, sst_merge_iters)?;

@@ -22,6 +22,7 @@ use std::sync::atomic::AtomicUsize;
 
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
+use crate::lsm_storage::BlockCache;
 use crate::table::{SsTable, SsTableBuilder};
 use crate::wal::Wal;
 use anyhow::Result;
@@ -142,14 +143,19 @@ impl MemTable {
     }
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
-    pub fn flush(&self, mut builder: SsTableBuilder, path: &PathBuf) -> Result<SsTable> {
+    pub fn flush(
+        &self,
+        mut builder: SsTableBuilder,
+        block_cache: Arc<BlockCache>,
+        path: &PathBuf,
+    ) -> Result<SsTable> {
         // can we do it in background?
         for entry in self.map.iter() {
             let key = entry.key();
             let value = entry.value();
             builder.add(KeySlice::from_slice(key.as_ref()), value.as_ref());
         }
-        let sst = builder.build(self.id(), None, &path)?;
+        let sst = builder.build(self.id(), Some(block_cache), &path)?;
         Ok(sst)
     }
 
