@@ -16,7 +16,6 @@
 
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
-use clap::ArgAction::SetTrue;
 
 /// Implements a bloom filter
 pub struct Bloom {

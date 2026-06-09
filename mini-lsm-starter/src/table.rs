@@ -23,7 +23,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 pub use builder::SsTableBuilder;
 use bytes::Bytes;
 use bytes::{Buf, BufMut};
@@ -178,16 +178,32 @@ impl SsTable {
         }
 
         let footer = file.read(file_size - 4, 4)?;
-        let block_meta_offset = u32::from_be_bytes(footer[..4].try_into().unwrap()) as usize;
+        let bloom_offset = u32::from_be_bytes(footer[..4].try_into().unwrap()) as usize;
+        if bloom_offset + 4 > file_size as usize {
+            bail!("invalid bloom offset in sst file, you fucked up!")
+        }
+        let bloom_bytes_length = file_size - bloom_offset as u64 - 4;
+        let bloom_bytes = file.read(bloom_offset as u64, bloom_bytes_length)?;
+        let bloom_filter = Bloom::decode(&bloom_bytes[..])
+            .context("decoding bloom filter failed in SstTable open")?;
+
+        if bloom_offset < 4 {
+            bail!("invalid bloom offset, SsTable open");
+        }
+        let meta_footer = file.read(bloom_offset as u64 - 4, 4)?;
+
+        let block_meta_offset = u32::from_be_bytes(meta_footer[..4].try_into().unwrap()) as usize;
 
         if block_meta_offset + 4 > file_size as usize {
-            bail!("invalid block meta offset in sst file");
+            bail!("invalid block meta offset, SsTable::open");
         }
+        if block_meta_offset > bloom_offset - 4 {
+            bail!("blokc meta offset is greater than bloom offset - 4, SsTable::open");
+        }
+        let meta_bytes_length = bloom_offset - 4 - block_meta_offset;
 
-        let meta_bytes = file.read(
-            block_meta_offset as u64,
-            file_size - block_meta_offset as u64 - 4,
-        )?;
+        let meta_bytes = file.read(block_meta_offset as u64, meta_bytes_length as u64)?;
+
         let block_meta = BlockMeta::decode_block_meta(&meta_bytes[..]);
         let Some(first_meta) = block_meta.first() else {
             bail!("sst file does not contain any block metadata");
@@ -211,7 +227,7 @@ impl SsTable {
             block_cache,
             first_key,
             last_key,
-            bloom: None,
+            bloom: Some(bloom_filter),
             max_ts: 0,
         })
     }

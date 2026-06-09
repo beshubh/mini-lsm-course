@@ -23,8 +23,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
+use nom::Err;
 use nom::character::streaming::tab;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -338,17 +339,24 @@ impl LsmStorageInner {
                 return Ok(val);
             }
         }
-
-        // Scan SsTable
-        let sst_iters = self.create_sst_iters(Bound::Included(key), Bound::Included(key), state)?;
         let key_slice = KeySlice::from_slice(key);
-        for sst_iter in &sst_iters {
-            if sst_iter.key() == key_slice {
-                let val = sst_iter.value();
-                if val.is_empty() {
-                    return Ok(None);
+        for sst in &state.l0_sstables {
+            let ss_table = state.sstables.get(sst);
+            let Some(st) = ss_table else {
+                bail!("SsTable does not exist in LsmState, should be impossible!");
+            };
+            let key_hash = farmhash::fingerprint32(key);
+            if let Some(bloom) = &st.bloom {
+                if bloom.may_contain(key_hash) {
+                    let sst_iter = SsTableIterator::create_and_seek_to_key(st.clone(), key_slice)?;
+                    if sst_iter.key() == key_slice {
+                        let val = sst_iter.value();
+                        if val.is_empty() {
+                            return Ok(None);
+                        }
+                        return Ok(Some(Bytes::copy_from_slice(val)));
+                    }
                 }
-                return Ok(Some(Bytes::copy_from_slice(val)));
             }
         }
         Ok(None)
@@ -493,7 +501,6 @@ impl LsmStorageInner {
             let table = table.clone();
             let first_key = table.first_key().raw_ref();
             let last_key = table.last_key().raw_ref();
-
             let skip_for_lower = match lower {
                 Bound::Included(target) => last_key < target,
                 Bound::Excluded(target) => last_key <= target,
