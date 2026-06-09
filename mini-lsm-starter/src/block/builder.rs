@@ -50,28 +50,45 @@ impl BlockBuilder {
     /// You may find the `bytes::BufMut` trait useful for manipulating binary data.
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
-        if !self.is_empty() && 2 + key.len() + 2 + value.len() + self.data.len() >= self.block_size
-        {
-            return false;
-        }
-
         let Ok(keyoffset) = self.data.len().try_into() else {
             eprintln!("data size too large, cannot put more keys to the block");
             return false;
         };
 
+        let mut overlap_len = 0;
         if self.offsets.is_empty() {
             self.first_key.set_from_slice(key);
+        } else {
+            overlap_len = self
+                .first_key()
+                .into_inner()
+                .iter()
+                .zip(key.into_inner().iter())
+                .take_while(|(a, b)| a == b)
+                .count();
         }
 
-        let keylen: u16 = key
+        let rest_key = &key.raw_ref()[overlap_len..];
+        // 2  overlap_len
+        // 2  rest_key_len
+        // N  rest_key
+        // 2  value_len
+        // M  value
+        if !self.is_empty()
+            && 2 + 2 + rest_key.len() + 2 + value.len() + self.data.len() >= self.block_size
+        {
+            return false;
+        }
+
+        let rest_key_len: u16 = rest_key
             .len()
             .try_into()
             .map_err(|_| "key too large to encode as u16")
             .unwrap();
 
-        self.data.put_u16(keylen);
-        self.data.put_slice(key.raw_ref());
+        self.data.put_u16(overlap_len as u16);
+        self.data.put_u16(rest_key_len);
+        self.data.put_slice(rest_key);
 
         let valuelen: u16 = value
             .len()
@@ -82,7 +99,6 @@ impl BlockBuilder {
         self.data.put_u16(valuelen);
         self.data.put_slice(value);
         self.offsets.push(keyoffset);
-
         self.last_key.set_from_slice(key);
         true
     }

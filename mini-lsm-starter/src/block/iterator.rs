@@ -24,14 +24,8 @@ use super::Block;
 /// ┌──────────────────────────────────────────────────────────────┐
 /// │                        Key-Value Entries                     │
 /// │                                                              │
-/// │  Entry 0: ┌──────┬─────────┬────────┬──────────┐            │
-/// │           │keylen│   key   │valuelen│   value  │            │
-/// │           │u16 BE│keylen B │ u16 BE │valuelen B│            │
-/// │           └──────┴─────────┴────────┴──────────┘            │
-/// │  Entry 1: ┌──────┬─────────┬────────┬──────────┐            │
-/// │           │keylen│   key   │valuelen│   value  │            │
-/// │           │u16 BE│keylen B │ u16 BE │valuelen B│            │
-/// │           └──────┴─────────┴────────┴──────────┘            │
+/// │  Entry 0: overlap_len | rest_len | rest_key | value_len | value          │
+/// │  Entry 1: overlap_len | rest_len | rest_key | value_len | value          │
 /// │  ...                                                         │
 /// │                                                              │
 /// ├──────────────────────────────────────────────────────────────┤
@@ -46,12 +40,10 @@ use super::Block;
 /// Key-value entry encoding within the data section:
 ///
 /// ```text
-/// ┌──────────┬──────────────────────┬──────────┬──────────────────┐
-/// │ keylen   │ key content          │ valuelen │ value content    │
-/// │ (2 bytes)│ (keylen bytes)       │ (2 bytes)│ (valuelen bytes) │
-/// └──────────┴──────────────────────┴──────────┴──────────────────┘
-///   ↑                                                            ↑
-///   offset for this entry points here                             end of entry
+/// ┌─────────┬─────────┬──────────────┬──────────┬──────────────────┐
+/// │ overlap │ rest len│ rest key     │ valuelen │ value content    │
+/// │ (u16)   │ (u16)   │ rest_len B   │ (u16)    │ valuelen bytes   │
+/// └─────────┴─────────┴──────────────┴──────────┴──────────────────┘
 /// ```
 
 /// Iterates on a block.
@@ -70,12 +62,24 @@ pub struct BlockIterator {
 
 impl BlockIterator {
     pub fn new(block: Arc<Block>) -> Self {
+        let first_key = if block.offsets.is_empty() {
+            KeyVec::new()
+        } else {
+            let mut pos = block.offsets[0] as usize;
+            let overlap_len = u16::from_be_bytes([block.data[pos], block.data[pos + 1]]) as usize;
+            debug_assert_eq!(overlap_len, 0);
+            pos += 2;
+            let rest_key_len = u16::from_be_bytes([block.data[pos], block.data[pos + 1]]) as usize;
+            pos += 2;
+            KeyVec::from_vec(block.data[pos..pos + rest_key_len].to_vec())
+        };
+
         Self {
             block,
             key: KeyVec::new(),
             value_range: (0, 0),
             idx: 0,
-            first_key: KeyVec::new(),
+            first_key,
         }
     }
 
@@ -85,11 +89,23 @@ impl BlockIterator {
         self.idx = self.block.offsets.len();
     }
 
-    fn key_at_idx(&self, idx: usize) -> KeySlice<'_> {
+    fn decode_key_at_idx(&self, idx: usize) -> (KeyVec, usize) {
         let mut pos = self.block.offsets[idx] as usize;
-        let keylen = u16::from_be_bytes([self.block.data[pos], self.block.data[pos + 1]]) as usize;
+        let overlap_len =
+            u16::from_be_bytes([self.block.data[pos], self.block.data[pos + 1]]) as usize;
         pos += 2;
-        KeySlice::from_slice(&self.block.data[pos..pos + keylen])
+        let rest_key_len =
+            u16::from_be_bytes([self.block.data[pos], self.block.data[pos + 1]]) as usize;
+        pos += 2;
+
+        let mut key = KeyVec::from_vec(self.first_key.raw_ref()[..overlap_len].to_vec());
+        key.append(&self.block.data[pos..pos + rest_key_len]);
+        pos += rest_key_len;
+        (key, pos)
+    }
+
+    fn key_at_idx(&self, idx: usize) -> KeyVec {
+        self.decode_key_at_idx(idx).0
     }
 
     fn seek_to_idx(&mut self, idx: usize) {
@@ -98,11 +114,7 @@ impl BlockIterator {
             return;
         }
 
-        let mut pos = self.block.offsets[idx] as usize;
-        let keylen = u16::from_be_bytes([self.block.data[pos], self.block.data[pos + 1]]) as usize;
-        pos += 2;
-        let key = KeyVec::from_vec(self.block.data[pos..pos + keylen].to_vec());
-        pos += keylen;
+        let (key, mut pos) = self.decode_key_at_idx(idx);
         let valuelen =
             u16::from_be_bytes([self.block.data[pos], self.block.data[pos + 1]]) as usize;
         pos += 2;
@@ -152,7 +164,6 @@ impl BlockIterator {
         }
 
         self.seek_to_idx(0);
-        self.first_key = self.key.clone();
     }
 
     /// Move to the next key in the block.
@@ -169,7 +180,7 @@ impl BlockIterator {
 
         while left < right {
             let mid = (left + right) / 2;
-            if self.key_at_idx(mid) < target {
+            if self.key_at_idx(mid).as_key_slice() < target {
                 left = mid + 1;
             } else {
                 right = mid;
