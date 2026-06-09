@@ -16,6 +16,7 @@
 
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
+use clap::ArgAction::SetTrue;
 
 /// Implements a bloom filter
 pub struct Bloom {
@@ -91,9 +92,15 @@ impl Bloom {
         let nbits = nbytes * 8;
         let mut filter = BytesMut::with_capacity(nbytes);
         filter.resize(nbytes, 0);
-
-        // TODO: build the bloom filter
-
+        for key in keys {
+            let mut h = *key;
+            let delta = h.rotate_left(15); // mixes hash bits
+            for _ in 0..k {
+                let bit_pos = (h as usize) % nbits;
+                filter.set_bit(bit_pos, true);
+                h = h.wrapping_add(delta);
+            }
+        }
         Self {
             filter: filter.freeze(),
             k: k as u8,
@@ -108,9 +115,12 @@ impl Bloom {
         } else {
             let nbits = self.filter.bit_len();
             let delta = h.rotate_left(15);
-
-            // TODO: probe the bloom filter
-
+            for _ in 0..self.k {
+                let bit_pos = (h as usize) % nbits;
+                if !self.filter.get_bit(bit_pos) {
+                    return false;
+                }
+            }
             true
         }
     }
