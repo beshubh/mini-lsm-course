@@ -45,7 +45,6 @@ use super::Block;
 /// │ (u16)   │ (u16)   │ rest_len B   │ (u16)    │ valuelen bytes   │
 /// └─────────┴─────────┴──────────────┴──────────┴──────────────────┘
 /// ```
-
 /// Iterates on a block.
 pub struct BlockIterator {
     /// The internal `Block`, wrapped by an `Arc`

@@ -58,6 +58,10 @@ impl SsTableBuilder {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        return self.builder.is_empty();
+    }
+
     /// Adds a key-value pair to SSTable.
     ///
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
@@ -144,7 +148,7 @@ impl SsTableBuilder {
         file.sync_all()?;
         Ok(SsTable {
             file: FileObject::open(path.as_ref())?,
-            block_meta_offset: meta_offset as usize,
+            block_meta_offset: meta_offset,
             block_meta: self.meta.clone(),
             first_key: KeyBytes::from_bytes(Bytes::from(self.first_key)),
             last_key: KeyBytes::from_bytes(Bytes::from(self.last_key)),

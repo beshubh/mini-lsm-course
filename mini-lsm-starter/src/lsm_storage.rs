@@ -525,10 +525,11 @@ impl LsmStorageInner {
                 Bound::Unbounded => SsTableIterator::create_and_seek_to_first(table)?,
             };
 
-            if let Bound::Excluded(key) = lower {
-                if sst_iter.is_valid() && sst_iter.key().raw_ref() == key {
-                    sst_iter.next()?;
-                }
+            if let Bound::Excluded(key) = lower
+                && sst_iter.is_valid()
+                && sst_iter.key().raw_ref() == key
+            {
+                sst_iter.next()?;
             }
 
             sst_iters.push(Box::new(sst_iter));
