@@ -267,29 +267,52 @@ impl LsmStorageInner {
             let state = self.state.read();
             state.clone()
         };
+        let l0_sstables = snapshot.l0_sstables.clone();
+        let l1_sstables = snapshot.levels[0].1.clone();
+        let mut sst_to_compact = self.get_sst_tables(&snapshot, &l0_sstables);
+        sst_to_compact.extend(self.get_sst_tables(&snapshot, &l1_sstables));
         let compaction_task = CompactionTask::ForceFullCompaction {
-            l0_sstables: snapshot.l0_sstables.clone(),
-            l1_sstables: snapshot.levels[0].1.clone(),
+            l0_sstables,
+            l1_sstables,
         };
-        let mut sst_to_compact = self.get_sst_tables(&snapshot, &snapshot.l0_sstables);
-        sst_to_compact.extend(self.get_sst_tables(&snapshot, &snapshot.levels[0].1));
-
         // do the compaction: should we think about doing this in a thread?
         let new_ssts = self.compact(&compaction_task)?;
         let new_sst_ids = new_ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>();
+
+        // What if while doing compaction there are new entries in l0_sstables
+        // A: we have copy of l0, so won't be an issue
 
         // update the state
         {
             let state_lock = self.state_lock.lock();
             let mut state_guard = self.state.write();
             let mut new_state = (**state_guard).clone();
-            new_state.l0_sstables.clear();
+
+            // remove compacted ssts from l0
+            sst_to_compact.iter().for_each(|compacted_sst| {
+                if let Some(idx) = new_state
+                    .l0_sstables
+                    .iter()
+                    .position(|x| *x == compacted_sst.sst_id())
+                {
+                    new_state.l0_sstables.remove(idx);
+                }
+            });
             new_state.levels[0].1 = new_sst_ids;
+            for sst in &sst_to_compact {
+                new_state.sstables.remove(&sst.sst_id());
+            }
+            for sst in new_ssts {
+                new_state.sstables.insert(sst.sst_id(), Arc::new(sst));
+            }
             *state_guard = Arc::new(new_state);
         }
 
         // remove all sst_to_compact files
-
+        for sst in sst_to_compact {
+            std::fs::remove_file(self.path_of_sst(sst.sst_id()))
+                .context("compaction: failed to remove compacted sst files")?;
+        }
         Ok(())
     }
 

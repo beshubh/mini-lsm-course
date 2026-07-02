@@ -109,7 +109,7 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
         }
         while let Some(mut top) = self.iters.pop() {
             // Log (K)
-            // Skip all the older keys, because latest one is the lates value.
+            // Skip all the older keys, because latest one is the latest value.
             if top.1.key() != current_key.as_key_slice() {
                 self.current = Some(top);
                 return Ok(());
