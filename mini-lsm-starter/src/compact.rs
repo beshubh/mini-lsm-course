@@ -125,11 +125,7 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
-    fn get_sst_tables(
-        &self,
-        snapshot: &LsmStorageState,
-        sst_ids: &Vec<usize>,
-    ) -> Vec<Arc<SsTable>> {
+    fn get_sst_tables(&self, snapshot: &LsmStorageState, sst_ids: &[usize]) -> Vec<Arc<SsTable>> {
         sst_ids
             .iter()
             .map(|sst_id| snapshot.sstables.get(sst_id).unwrap().clone())
@@ -140,10 +136,17 @@ impl LsmStorageInner {
         &self,
         snapshot: &LsmStorageState,
         merge_iterator: &mut MergeIterator<SsTableIterator>,
+        compact_to_bottom_level: bool,
     ) -> Result<Vec<SsTable>> {
         let mut sst_builder = SsTableBuilder::new(self.options.block_size);
         let mut new_sstables = vec![];
         while merge_iterator.is_valid() {
+            if merge_iterator.value().is_empty() && compact_to_bottom_level {
+                merge_iterator
+                    .next()
+                    .context("compaction_and_generate: failed to advance while compaction")?;
+                continue;
+            }
             sst_builder.add(merge_iterator.key(), merge_iterator.value());
             merge_iterator
                 .next()
@@ -217,7 +220,11 @@ impl LsmStorageInner {
                 });
 
                 let mut merge_iterator = MergeIterator::create(iters);
-                self.compact_and_generate(&snapshot, &mut merge_iterator)
+                self.compact_and_generate(
+                    &snapshot,
+                    &mut merge_iterator,
+                    task.compact_to_bottom_level(),
+                )
             }
             CompactionTask::Tiered(TieredCompactionTask {
                 tiers,
@@ -237,7 +244,11 @@ impl LsmStorageInner {
                     ));
                 });
                 let mut merge_iter = MergeIterator::create(iters);
-                self.compact_and_generate(&snapshot, &mut merge_iter)
+                self.compact_and_generate(
+                    &snapshot,
+                    &mut merge_iter,
+                    task.compact_to_bottom_level(),
+                )
             }
             CompactionTask::ForceFullCompaction {
                 l0_sstables,
@@ -257,7 +268,11 @@ impl LsmStorageInner {
                     ));
                 });
                 let mut merge_iter = MergeIterator::create(iters);
-                self.compact_and_generate(&snapshot, &mut merge_iter)
+                self.compact_and_generate(
+                    &snapshot,
+                    &mut merge_iter,
+                    task.compact_to_bottom_level(),
+                )
             }
         }
     }
@@ -287,7 +302,6 @@ impl LsmStorageInner {
             let state_lock = self.state_lock.lock();
             let mut state_guard = self.state.write();
             let mut new_state = (**state_guard).clone();
-
             // remove compacted ssts from l0
             sst_to_compact.iter().for_each(|compacted_sst| {
                 if let Some(idx) = new_state
@@ -298,6 +312,7 @@ impl LsmStorageInner {
                     new_state.l0_sstables.remove(idx);
                 }
             });
+
             new_state.levels[0].1 = new_sst_ids;
             for sst in &sst_to_compact {
                 new_state.sstables.remove(&sst.sst_id());

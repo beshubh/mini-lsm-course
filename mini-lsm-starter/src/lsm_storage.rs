@@ -455,7 +455,7 @@ impl LsmStorageInner {
         let Some(last_memtable) = snapshot.imm_memtables.last() else {
             return Ok(());
         };
-        let path = self.path.join(format!("{}.sst", last_memtable.id()));
+        let path = self.path_of_sst(last_memtable.id());
         let block_cache = self.block_cache.clone();
         let sst = last_memtable.flush(
             SsTableBuilder::new(self.options.block_size),
