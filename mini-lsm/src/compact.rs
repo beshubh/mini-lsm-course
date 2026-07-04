@@ -173,6 +173,7 @@ impl LsmStorageInner {
     }
 
     fn compact(&self, task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
+        // TODO:  implementation required
         let snapshot = {
             let state = self.state.read();
             state.clone()
@@ -265,6 +266,7 @@ impl LsmStorageInner {
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
+        // TODO: implementation is required here
         let CompactionOptions::NoCompaction = self.options.compaction_options else {
             panic!("full compaction can only be called with compaction is not enabled")
         };
