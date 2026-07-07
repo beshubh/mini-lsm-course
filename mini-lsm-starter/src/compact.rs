@@ -182,11 +182,7 @@ impl LsmStorageInner {
         Ok(new_sstables)
     }
 
-    fn compact(&self, task: &CompactionTask) -> Result<Vec<SsTable>> {
-        let snapshot = {
-            let state = self.state.read();
-            state.clone()
-        };
+    fn compact(&self, task: &CompactionTask, snapshot: &LsmStorageState) -> Result<Vec<SsTable>> {
         match task {
             CompactionTask::Leveled(LeveledCompactionTask {
                 upper_level,
@@ -202,10 +198,10 @@ impl LsmStorageInner {
                 lower_level_sst_ids,
                 is_lower_level_bottom_level,
             }) => {
-                let mut upper_level_sstables = self.get_sst_tables(&snapshot, upper_level_sst_ids);
-                let lower_level_sstables = self.get_sst_tables(&snapshot, lower_level_sst_ids);
+                let mut upper_level_sstables = self.get_sst_tables(snapshot, upper_level_sst_ids);
+                let lower_level_sstables = self.get_sst_tables(snapshot, lower_level_sst_ids);
                 if upper_level.is_none() {
-                    upper_level_sstables = self.get_sst_tables(&snapshot, &snapshot.l0_sstables);
+                    upper_level_sstables = self.get_sst_tables(snapshot, &snapshot.l0_sstables);
                 }
                 let mut iters = vec![];
                 upper_level_sstables.iter().for_each(|ss_table| {
@@ -221,7 +217,7 @@ impl LsmStorageInner {
 
                 let mut merge_iterator = MergeIterator::create(iters);
                 self.compact_and_generate(
-                    &snapshot,
+                    snapshot,
                     &mut merge_iterator,
                     task.compact_to_bottom_level(),
                 )
@@ -236,7 +232,7 @@ impl LsmStorageInner {
                         sst_table_ids.push(*sst_id);
                     }
                 }
-                let ss_tables = self.get_sst_tables(&snapshot, &sst_table_ids);
+                let ss_tables = self.get_sst_tables(snapshot, &sst_table_ids);
                 let mut iters = vec![];
                 ss_tables.iter().for_each(|sst| {
                     iters.push(Box::new(
@@ -244,18 +240,14 @@ impl LsmStorageInner {
                     ));
                 });
                 let mut merge_iter = MergeIterator::create(iters);
-                self.compact_and_generate(
-                    &snapshot,
-                    &mut merge_iter,
-                    task.compact_to_bottom_level(),
-                )
+                self.compact_and_generate(snapshot, &mut merge_iter, task.compact_to_bottom_level())
             }
             CompactionTask::ForceFullCompaction {
                 l0_sstables,
                 l1_sstables,
             } => {
-                let l0_sst = self.get_sst_tables(&snapshot, l0_sstables);
-                let l1_sst = self.get_sst_tables(&snapshot, l1_sstables);
+                let l0_sst = self.get_sst_tables(snapshot, l0_sstables);
+                let l1_sst = self.get_sst_tables(snapshot, l1_sstables);
                 let mut iters = vec![];
                 l0_sst.iter().for_each(|sst| {
                     iters.push(Box::new(
@@ -268,11 +260,7 @@ impl LsmStorageInner {
                     ));
                 });
                 let mut merge_iter = MergeIterator::create(iters);
-                self.compact_and_generate(
-                    &snapshot,
-                    &mut merge_iter,
-                    task.compact_to_bottom_level(),
-                )
+                self.compact_and_generate(snapshot, &mut merge_iter, task.compact_to_bottom_level())
             }
         }
     }
@@ -291,7 +279,7 @@ impl LsmStorageInner {
             l1_sstables,
         };
         // do the compaction: should we think about doing this in a thread?
-        let new_ssts = self.compact(&compaction_task)?;
+        let new_ssts = self.compact(&compaction_task, &snapshot)?;
         let new_sst_ids = new_ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>();
 
         // What if while doing compaction there are new entries in l0_sstables
@@ -332,7 +320,48 @@ impl LsmStorageInner {
     }
 
     fn trigger_compaction(&self) -> Result<()> {
-        unimplemented!()
+        let controller = match &self.options.compaction_options {
+            CompactionOptions::Simple(opts) => {
+                let simple_controller = SimpleLeveledCompactionController::new(opts.clone());
+                CompactionController::Simple(simple_controller)
+            }
+            _ => todo!(),
+        };
+        let snapshot = {
+            let snapshot = self.state.read();
+            snapshot.clone()
+        };
+        let compaction_res = controller.generate_compaction_task(&snapshot);
+        // drop the read snapshot
+
+        if let Some(task) = compaction_res {
+            let new_ssts = self.compact(&task, &snapshot)?;
+            drop(snapshot);
+            let output = new_ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>();
+            let state_lock = self.state_lock.lock();
+            let mut state_guard = self.state.write();
+            let snapshot = (**state_guard).clone();
+            let (mut new_state, deleted_ssts) =
+                controller.apply_compaction_result(&snapshot, &task, &output, false);
+
+            // remove deleted ssts from sstables
+            deleted_ssts.iter().for_each(|sst_id| {
+                new_state.sstables.remove(sst_id);
+            });
+
+            // add new generated ssts to sstables
+            for sst in new_ssts {
+                new_state.sstables.insert(sst.sst_id(), Arc::new(sst));
+            }
+
+            *state_guard = Arc::new(new_state);
+            // remove files of deleted ssts
+            for sst in deleted_ssts {
+                std::fs::remove_file(self.path_of_sst(sst))
+                    .context("compaction: failed to remove compacted sst, trigg")?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn spawn_compaction_thread(

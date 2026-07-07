@@ -53,42 +53,15 @@ impl SimpleLeveledCompactionController {
         &self,
         snapshot: &LsmStorageState,
     ) -> Option<SimpleLeveledCompactionTask> {
-        if snapshot.l0_sstables.len() >= self.options.level0_file_num_compaction_trigger {
-            // L0 compaction
+        if snapshot.l0_sstables >= self.options.level0_file_num_compaction_trigger {
             return Some(SimpleLeveledCompactionTask {
                 upper_level: None,
-                upper_level_sst_ids: snapshot.l0_sstables.clone(),
-                lower_level: 1,
-                lower_level_sst_ids: snapshot.levels[0].1.clone(),
-                is_lower_level_bottom_level: self.options.max_levels == 1,
+                upper_level_sst_ids: vec![],
+                lower_level: 0,
+                lower_level_sst_ids: snapshot.levels[0].1,
+                is_lower_level_bottom_level: false,
             });
         }
-        // L1 [ ] upper most
-        // L2 [ ] [ ]
-        // L3 [ ] [ ] [ ] lower most
-        for upper in 0..self.options.max_levels - 1 {
-            // TODO: what should we do if the levels currently do not have this lower level or upper
-            // level? ideally we should just trust LSMStorageState::create, that it will crease the levels
-            let lower = upper + 1;
-            let lower_level_num_files = snapshot.levels[lower].1.len();
-            let upper_level_num_files = snapshot.levels[upper].1.len();
-            if upper_level_num_files == 0 {
-                continue;
-            }
-            if (lower_level_num_files / upper_level_num_files) * 100
-                < self.options.size_ratio_percent
-            {
-                // we should compact
-                return Some(SimpleLeveledCompactionTask {
-                    upper_level: Some(upper + 1),
-                    upper_level_sst_ids: snapshot.levels[upper].1.clone(),
-                    lower_level: lower + 1,
-                    lower_level_sst_ids: snapshot.levels[lower].1.clone(),
-                    is_lower_level_bottom_level: lower == self.options.max_levels - 1,
-                });
-            }
-        }
-        None
     }
 
     /// Apply the compaction result.
@@ -100,30 +73,10 @@ impl SimpleLeveledCompactionController {
     /// in your implementation.
     pub fn apply_compaction_result(
         &self,
-        snapshot: &LsmStorageState,
-        task: &SimpleLeveledCompactionTask,
-        output: &[usize],
+        _snapshot: &LsmStorageState,
+        _task: &SimpleLeveledCompactionTask,
+        _output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
-        let mut new_state = snapshot.clone();
-        let mut compacted_sst_ids = task.upper_level_sst_ids.clone();
-        compacted_sst_ids.extend(task.lower_level_sst_ids.iter());
-        if let Some(upper_level) = task.upper_level {
-            new_state.levels[upper_level - 1].1.clear();
-        } else {
-            compacted_sst_ids.iter().for_each(|compacted_sst| {
-                if let Some(position) = new_state
-                    .l0_sstables
-                    .iter()
-                    .position(|x| x == compacted_sst)
-                {
-                    new_state.l0_sstables.remove(position);
-                }
-                // we don't do this?
-                // new_state.sstables.remove(&compacted_sst);
-            });
-        }
-        new_state.levels[task.lower_level - 1].1.clear();
-        new_state.levels[task.lower_level - 1].1.extend(output);
-        (new_state, compacted_sst_ids)
+        unimplemented!()
     }
 }
