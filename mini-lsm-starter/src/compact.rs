@@ -341,6 +341,10 @@ impl LsmStorageInner {
                 let simple_controller = SimpleLeveledCompactionController::new(opts.clone());
                 CompactionController::Simple(simple_controller)
             }
+            CompactionOptions::Tiered(options) => {
+                let tiered_controller = TieredCompactionController::new(options.clone());
+                CompactionController::Tiered(tiered_controller)
+            }
             _ => todo!(),
         };
         let snapshot = {
