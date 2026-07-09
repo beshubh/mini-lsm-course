@@ -589,21 +589,21 @@ impl LsmStorageInner {
     fn create_concat_iters(
         &self,
         snapshot: &LsmStorageState,
-        l1_sst_ids: &[usize],
+        leve_sst_ids: &[usize],
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<SstConcatIterator> {
-        let l1_sstables = self.get_sstables(snapshot, l1_sst_ids);
+        let level_sstables = self.get_sstables(snapshot, leve_sst_ids);
 
         // First SST whose range can contain the lower bound.
         let lower_idx = match lower {
             Bound::Unbounded => 0,
             _ => {
                 let mut left = 0;
-                let mut right = l1_sstables.len();
+                let mut right = level_sstables.len();
                 while left < right {
                     let mid = left + (right - left) / 2;
-                    let last_key = l1_sstables[mid].last_key().raw_ref();
+                    let last_key = level_sstables[mid].last_key().raw_ref();
                     let lower_is_to_the_right = match lower {
                         Bound::Included(target) => last_key < target,
                         Bound::Excluded(target) => last_key <= target,
@@ -621,13 +621,13 @@ impl LsmStorageInner {
 
         // First SST whose range starts after the upper bound. This is the exclusive end index.
         let upper_idx = match upper {
-            Bound::Unbounded => l1_sstables.len(),
+            Bound::Unbounded => level_sstables.len(),
             _ => {
                 let mut left = 0;
-                let mut right = l1_sstables.len();
+                let mut right = level_sstables.len();
                 while left < right {
                     let mid = left + (right - left) / 2;
-                    let first_key = l1_sstables[mid].first_key().raw_ref();
+                    let first_key = level_sstables[mid].first_key().raw_ref();
                     let mid_is_after_upper = match upper {
                         Bound::Included(target) => first_key > target,
                         Bound::Excluded(target) => first_key >= target,
@@ -647,7 +647,7 @@ impl LsmStorageInner {
             return SstConcatIterator::create_and_seek_to_first(vec![]);
         }
 
-        let include_vec = l1_sstables[lower_idx..upper_idx].to_vec();
+        let include_vec = level_sstables[lower_idx..upper_idx].to_vec();
         let mut iter = match lower {
             Bound::Included(key) | Bound::Excluded(key) => {
                 SstConcatIterator::create_and_seek_to_key(include_vec, KeySlice::from_slice(key))?
@@ -698,10 +698,17 @@ impl LsmStorageInner {
         let mem_iters_and_l0_sst_iters =
             TwoMergeIterator::create(mem_merge_iters, sst_merge_iters)?;
         // l1 concat iterators
-        let l1_sst_ids = &snapshot.levels[0].1;
-        let l1_sstables = self.get_sstables(&snapshot, l1_sst_ids);
-        let l1_concat_iter = self.create_concat_iters(&snapshot, l1_sst_ids, lower, upper)?;
-        let inner = TwoMergeIterator::create(mem_iters_and_l0_sst_iters, l1_concat_iter)?;
+        let mut level_iters = vec![];
+        for (level, level_sst_ids) in &snapshot.levels {
+            level_iters.push(Box::new(self.create_concat_iters(
+                &snapshot,
+                level_sst_ids,
+                lower,
+                upper,
+            )?));
+        }
+        let level_merge_iter = MergeIterator::create(level_iters);
+        let inner = TwoMergeIterator::create(mem_iters_and_l0_sst_iters, level_merge_iter)?;
         let iter = LsmIterator::new(inner, map_bound(upper).clone())?;
         Ok(FusedIterator::new(iter))
     }

@@ -59,7 +59,7 @@ impl SsTableBuilder {
     }
 
     pub fn is_empty(&self) -> bool {
-        return self.builder.is_empty();
+        self.builder.is_empty()
     }
 
     /// Adds a key-value pair to SSTable.

@@ -105,15 +105,9 @@ impl<
             return Ok(());
         }
         if self.a.is_valid() && self.b.is_valid() {
-            if self.a.key() <= self.b.key() {
-                self.current_a = true;
-            } else {
-                self.current_a = false;
-            }
-        } else if self.a.is_valid() {
-            self.current_a = true;
+            self.current_a = self.a.key() <= self.b.key();
         } else {
-            self.current_a = false;
+            self.current_a = self.a.is_valid();
         }
 
         Ok(())

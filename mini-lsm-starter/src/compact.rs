@@ -137,7 +137,7 @@ impl LsmStorageInner {
 
     fn compact_and_generate<I>(
         &self,
-        merge_iterator: &mut I,
+        iter: &mut I,
         compact_to_bottom_level: bool,
     ) -> Result<Vec<SsTable>>
     where
@@ -145,16 +145,14 @@ impl LsmStorageInner {
     {
         let mut sst_builder = SsTableBuilder::new(self.options.block_size);
         let mut new_sstables = vec![];
-        while merge_iterator.is_valid() {
-            if merge_iterator.value().is_empty() && compact_to_bottom_level {
-                merge_iterator
-                    .next()
+        while iter.is_valid() {
+            if iter.value().is_empty() && compact_to_bottom_level {
+                iter.next()
                     .context("compaction_and_generate: failed to advance while compaction")?;
                 continue;
             }
-            sst_builder.add(merge_iterator.key(), merge_iterator.value());
-            merge_iterator
-                .next()
+            sst_builder.add(iter.key(), iter.value());
+            iter.next()
                 .context("compaction_and_generate: failed to advance while compaction")?;
             // when SST gets too big we split it.
             if sst_builder.estimated_size() >= self.options.target_sst_size {
