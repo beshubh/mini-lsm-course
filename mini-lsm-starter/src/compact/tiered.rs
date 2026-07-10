@@ -57,6 +57,9 @@ impl TieredCompactionController {
         // trigger by space amplification
         // space_amplification estimate = engine_size / last_level_size
         // space amplication = all tiers except last / last tier size
+        if snapshot.levels.len() < self.options.num_tiers {
+            return None;
+        }
         if snapshot.levels.is_empty() {
             return None;
         }
@@ -78,9 +81,26 @@ impl TieredCompactionController {
         let space_amplification = upper_tier_size as f64 / last_tier_size as f64;
         if space_amplification >= self.options.max_size_amplification_percent as f64 * 0.01 {
             return Some(TieredCompactionTask {
-                tiers: snapshot.levels.clone().into_iter().collect::<Vec<_>>(),
+                tiers: snapshot.levels.clone(),
                 bottom_tier_included: true,
             });
+        }
+
+        // tiers  -> newest to oldest
+        let mut previous_tier_size_sum = Self::tier_size(&snapshot.levels.first().unwrap().1);
+        let trigger = (100 + self.options.size_ratio) as f64 * 0.01;
+        for idx in 1..snapshot.levels.len() {
+            let tier_ssts = &snapshot.levels[idx].1;
+            let current_tier_size = Self::tier_size(tier_ssts);
+            if current_tier_size as f64 / previous_tier_size_sum as f64 > trigger
+                && idx >= self.options.min_merge_width
+            {
+                return Some(TieredCompactionTask {
+                    tiers: snapshot.levels.clone().into_iter().take(idx).collect(),
+                    bottom_tier_included: false,
+                });
+            }
+            previous_tier_size_sum += current_tier_size;
         }
 
         if snapshot.levels.len() >= self.options.num_tiers {
