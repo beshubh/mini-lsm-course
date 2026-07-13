@@ -520,27 +520,19 @@ impl LsmStorageInner {
             let mut new_state = (**state_guard).clone();
 
             dbg!("coming here to modify the state");
-            match &self.options.compaction_options {
-                CompactionOptions::Tiered(options) => {
-                    new_state.imm_memtables.pop();
-                    new_state
-                        .levels
-                        .insert(0, (sst.sst_id(), vec![sst.sst_id()]));
-                    dbg!("coming here in tiered comnpaction flush");
-                    new_state.sstables.insert(sst.sst_id(), Arc::new(sst));
-                    dbg!(
-                        "State after flush",
-                        new_state.sstables.keys().collect::<Vec<_>>()
-                    );
-                    *state_guard = Arc::new(new_state);
-                }
-                _ => {
-                    new_state.imm_memtables.pop(); // O(1) operation, cheap
-                    new_state.l0_sstables.insert(0, sst.sst_id()); // O(len(l0_sstables)), not that expensive
-                    new_state.sstables.insert(sst.sst_id(), Arc::new(sst));
-                    *state_guard = Arc::new(new_state); // O(1) operation
-                }
-            };
+
+            new_state.imm_memtables.pop();
+            if self.compaction_controller.flush_to_l0() {
+                new_state.l0_sstables.insert(0, sst.sst_id()); // O(len(l0_sstables)), not that expensive
+                new_state.sstables.insert(sst.sst_id(), Arc::new(sst));
+            } else {
+                new_state
+                    .levels
+                    .insert(0, (sst.sst_id(), vec![sst.sst_id()]));
+                new_state.sstables.insert(sst.sst_id(), Arc::new(sst));
+            }
+
+            *state_guard = Arc::new(new_state); // O(1) operation
         } // write guard droppped.
         Ok(())
     }
