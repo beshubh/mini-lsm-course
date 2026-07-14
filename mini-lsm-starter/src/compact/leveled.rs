@@ -107,10 +107,10 @@ impl LeveledCompactionController {
                 .iter_mut()
                 .rev()
             {
-                *next_target = current_target / self.options.level_size_multiplier;
-                if *next_target < base_level_size_bytes {
+                if current_target <= base_level_size_bytes {
                     break;
                 }
+                *next_target = current_target / self.options.level_size_multiplier;
                 current_target = *next_target;
             }
         }
@@ -136,7 +136,39 @@ impl LeveledCompactionController {
                     == snapshot.levels.len() - 1,
             });
         }
-
+        // priority
+        let mut priority = vec![0f64; self.options.max_levels];
+        for i in 0..actual_level_sizes.len() {
+            let current_size = actual_level_sizes[i];
+            let target_size = target_sizes[i];
+            let ratio = current_size as f64 / target_size as f64;
+            if ratio > 1.0 {
+                priority[i] = ratio;
+            }
+        }
+        let upper_idx = priority
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b));
+        if let Some((upper_idx, max_priority)) = upper_idx {
+            if *max_priority < 1.0 {
+                return None;
+            }
+            // select the oldest for now
+            // TODO: for practice we can choose an SST with large number of tombstones
+            let upper_sst_ids = vec![*snapshot.levels[upper_idx].1.iter().min().unwrap()];
+            return Some(LeveledCompactionTask {
+                upper_level: Some(upper_idx + 1),
+                lower_level_sst_ids: self.find_overlapping_ssts(
+                    snapshot,
+                    &upper_sst_ids,
+                    upper_idx + 2,
+                ),
+                upper_level_sst_ids: upper_sst_ids,
+                lower_level: upper_idx + 2,
+                is_lower_level_bottom_level: upper_idx + 2 == snapshot.levels.len(),
+            });
+        }
         None
     }
 
