@@ -67,7 +67,7 @@ impl SimpleLeveledCompactionController {
         // L3 [ ] [ ] [ ] lower most
         for upper in 0..self.options.max_levels - 1 {
             // TODO: what should we do if the levels currently do not have this lower level or upper
-            // level? ideally we should just trust LSMStorageState::create, that it will crease the levels
+            // level? ideally we should just trust LSMStorageState::create, that it will create the levels
             let lower = upper + 1;
             let lower_level_num_files = snapshot.levels[lower].1.len();
             let upper_level_num_files = snapshot.levels[upper].1.len();

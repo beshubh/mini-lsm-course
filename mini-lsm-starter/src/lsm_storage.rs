@@ -29,6 +29,7 @@ use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::block::Block;
+use crate::common::overlapping_sst_range;
 use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
@@ -609,59 +610,12 @@ impl LsmStorageInner {
     ) -> Result<SstConcatIterator> {
         let level_sstables = self.get_sstables(snapshot, leve_sst_ids);
 
-        // First SST whose range can contain the lower bound.
-        let lower_idx = match lower {
-            Bound::Unbounded => 0,
-            _ => {
-                let mut left = 0;
-                let mut right = level_sstables.len();
-                while left < right {
-                    let mid = left + (right - left) / 2;
-                    let last_key = level_sstables[mid].last_key().raw_ref();
-                    let lower_is_to_the_right = match lower {
-                        Bound::Included(target) => last_key < target,
-                        Bound::Excluded(target) => last_key <= target,
-                        _ => unreachable!(),
-                    };
-                    if lower_is_to_the_right {
-                        left = mid + 1;
-                    } else {
-                        right = mid;
-                    }
-                }
-                left
-            }
-        };
-
-        // First SST whose range starts after the upper bound. This is the exclusive end index.
-        let upper_idx = match upper {
-            Bound::Unbounded => level_sstables.len(),
-            _ => {
-                let mut left = 0;
-                let mut right = level_sstables.len();
-                while left < right {
-                    let mid = left + (right - left) / 2;
-                    let first_key = level_sstables[mid].first_key().raw_ref();
-                    let mid_is_after_upper = match upper {
-                        Bound::Included(target) => first_key > target,
-                        Bound::Excluded(target) => first_key >= target,
-                        _ => unreachable!(),
-                    };
-                    if mid_is_after_upper {
-                        right = mid;
-                    } else {
-                        left = mid + 1;
-                    }
-                }
-                left
-            }
-        };
-
-        if lower_idx >= upper_idx {
+        let range = overlapping_sst_range(&level_sstables, lower, upper);
+        if range.is_empty() {
             return SstConcatIterator::create_and_seek_to_first(vec![]);
         }
 
-        let include_vec = level_sstables[lower_idx..upper_idx].to_vec();
+        let include_vec = level_sstables[range].to_vec();
         let mut iter = match lower {
             Bound::Included(key) | Bound::Excluded(key) => {
                 SstConcatIterator::create_and_seek_to_key(include_vec, KeySlice::from_slice(key))?

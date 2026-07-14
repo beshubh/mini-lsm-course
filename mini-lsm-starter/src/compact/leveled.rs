@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::table::SsTable;
 use serde::{Deserialize, Serialize};
+use std::ops::Bound;
+use std::sync::Arc;
 
+use crate::common::overlapping_sst_range;
 use crate::lsm_storage::LsmStorageState;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,27 +49,142 @@ impl LeveledCompactionController {
 
     fn find_overlapping_ssts(
         &self,
-        _snapshot: &LsmStorageState,
-        _sst_ids: &[usize],
-        _in_level: usize,
+        snapshot: &LsmStorageState,
+        sst_ids: &[usize],
+        in_level: usize,
     ) -> Vec<usize> {
-        unimplemented!()
+        let level_sst_ids = &snapshot.levels[in_level - 1].1;
+        let sst_tables = self.get_sstables(snapshot, sst_ids);
+        let level_sstables = self.get_sstables(snapshot, level_sst_ids);
+        if sst_tables.is_empty() {
+            return vec![];
+        }
+        let min_key = sst_tables.iter().map(|sst| sst.first_key()).min().unwrap();
+        let max_key = sst_tables.iter().map(|sst| sst.last_key()).max().unwrap();
+        let range = overlapping_sst_range(
+            &level_sstables,
+            Bound::Included(min_key.raw_ref()),
+            Bound::Included(max_key.raw_ref()),
+        );
+
+        level_sstables[range]
+            .iter()
+            .map(|sst| sst.sst_id())
+            .collect()
     }
 
+    fn get_sstables(&self, snapshot: &LsmStorageState, sst_ids: &[usize]) -> Vec<Arc<SsTable>> {
+        sst_ids
+            .iter()
+            .map(|sst_id| {
+                // unwrap should be safe here?
+                snapshot.sstables.get(sst_id).unwrap().clone()
+            })
+            .collect()
+    }
     pub fn generate_compaction_task(
         &self,
-        _snapshot: &LsmStorageState,
+        snapshot: &LsmStorageState,
     ) -> Option<LeveledCompactionTask> {
-        unimplemented!()
+        // actual sizes calculation
+        let mut actual_level_sizes = vec![0u64; self.options.max_levels];
+        for (i, item) in actual_level_sizes.iter_mut().enumerate() {
+            let sstables = self.get_sstables(snapshot, &snapshot.levels[i].1);
+            *item = sstables.iter().map(|sst| sst.file.size()).sum::<u64>();
+        }
+
+        // target size calculation
+        let actual_bottom_size = *actual_level_sizes.last().unwrap() as usize;
+        let base_level_size_bytes = self.options.base_level_size_mb * 1024 * 1024;
+        let mut bottom_target = actual_bottom_size;
+        let mut target_sizes = vec![0; self.options.max_levels];
+
+        if actual_bottom_size <= base_level_size_bytes {
+            bottom_target = base_level_size_bytes;
+        } else {
+            let mut current_target = bottom_target;
+            for next_target in target_sizes[..actual_level_sizes.len() - 1]
+                .iter_mut()
+                .rev()
+            {
+                *next_target = current_target / self.options.level_size_multiplier;
+                if *next_target < base_level_size_bytes {
+                    break;
+                }
+                current_target = *next_target;
+            }
+        }
+        *target_sizes.last_mut().unwrap() = bottom_target;
+        let mut first_non_zero_target_level_idx = target_sizes.len();
+        for (idx, target) in target_sizes.iter().enumerate() {
+            if *target > 0 {
+                first_non_zero_target_level_idx = idx;
+                break;
+            }
+        }
+        if snapshot.l0_sstables.len() >= self.options.level0_file_num_compaction_trigger {
+            return Some(LeveledCompactionTask {
+                upper_level: None,
+                upper_level_sst_ids: snapshot.l0_sstables.clone(),
+                lower_level: first_non_zero_target_level_idx + 1,
+                lower_level_sst_ids: self.find_overlapping_ssts(
+                    snapshot,
+                    &snapshot.l0_sstables,
+                    first_non_zero_target_level_idx + 1,
+                ),
+                is_lower_level_bottom_level: first_non_zero_target_level_idx
+                    == snapshot.levels.len() - 1,
+            });
+        }
+
+        None
     }
 
     pub fn apply_compaction_result(
         &self,
-        _snapshot: &LsmStorageState,
-        _task: &LeveledCompactionTask,
-        _output: &[usize],
-        _in_recovery: bool,
+        snapshot: &LsmStorageState,
+        task: &LeveledCompactionTask,
+        output: &[usize],
+        in_recovery: bool,
     ) -> (LsmStorageState, Vec<usize>) {
-        unimplemented!()
+        let mut new_state = snapshot.clone();
+        let mut compacted_sst_ids = task.upper_level_sst_ids.clone();
+        compacted_sst_ids.extend(task.lower_level_sst_ids.iter());
+
+        let mut remove_compacted = |in_level: usize| {
+            compacted_sst_ids.iter().for_each(|compacted_sst| {
+                if let Some(position) = new_state.levels[in_level - 1]
+                    .1
+                    .iter()
+                    .position(|x| x == compacted_sst)
+                {
+                    new_state.levels[in_level - 1].1.remove(position);
+                }
+            });
+        };
+        if let Some(upper_level) = task.upper_level {
+            remove_compacted(upper_level);
+        } else {
+            compacted_sst_ids.iter().for_each(|compacted_sst| {
+                if let Some(position) = new_state
+                    .l0_sstables
+                    .iter()
+                    .position(|x| x == compacted_sst)
+                {
+                    new_state.l0_sstables.remove(position);
+                }
+            });
+        }
+        remove_compacted(task.lower_level);
+        new_state.levels[task.lower_level - 1].1.extend(output);
+        if !in_recovery {
+            new_state.levels[task.lower_level - 1]
+                .1
+                .sort_by_key(|sst_id| {
+                    let sst = new_state.sstables.get(sst_id).unwrap();
+                    sst.first_key()
+                });
+        }
+        (new_state, compacted_sst_ids)
     }
 }

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod block;
+mod common;
 pub mod compact;
 pub mod debug;
 pub mod iterators;
