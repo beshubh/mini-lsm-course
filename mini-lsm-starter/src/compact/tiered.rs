@@ -75,15 +75,14 @@ impl TieredCompactionController {
 
         let last_tier_size = Self::tier_size(&snapshot.levels.last().unwrap().1);
 
-        if last_tier_size == 0 {
-            return None;
-        }
-        let space_amplification = upper_tier_size as f64 / last_tier_size as f64;
-        if space_amplification >= self.options.max_size_amplification_percent as f64 * 0.01 {
-            return Some(TieredCompactionTask {
-                tiers: snapshot.levels.clone(),
-                bottom_tier_included: true,
-            });
+        if last_tier_size > 0 {
+            let space_amplification = upper_tier_size as f64 / last_tier_size as f64;
+            if space_amplification >= self.options.max_size_amplification_percent as f64 * 0.01 {
+                return Some(TieredCompactionTask {
+                    tiers: snapshot.levels.clone(),
+                    bottom_tier_included: true,
+                });
+            }
         }
 
         // tiers  -> newest to oldest

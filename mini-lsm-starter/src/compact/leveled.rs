@@ -141,6 +141,9 @@ impl LeveledCompactionController {
         for i in 0..actual_level_sizes.len() {
             let current_size = actual_level_sizes[i];
             let target_size = target_sizes[i];
+            if target_size == 0 {
+                continue;
+            }
             let ratio = current_size as f64 / target_size as f64;
             if ratio > 1.0 {
                 priority[i] = ratio;
