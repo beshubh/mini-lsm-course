@@ -19,12 +19,13 @@ use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::key::KeySlice;
 use std::collections::HashMap;
+use std::fs::File;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -37,7 +38,7 @@ use crate::compact::{
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
@@ -178,13 +179,28 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        let handle = {
+        let flush_handle = {
             let mut guard = self.flush_thread.lock();
             guard.take()
         };
-        if let Some(handle) = handle {
+        let compaction_handle = {
+            let mut guard = self.compaction_thread.lock();
+            guard.take()
+        };
+        if let Some(handle) = flush_handle {
+            self.flush_notifier
+                .send(())
+                .context("notify flush thread to stop")?;
             handle.join().expect("flush thread panicked.");
         }
+        if let Some(handle) = compaction_handle {
+            self.compaction_notifier
+                .send(())
+                .context("notify compaction thread to stop")?;
+            handle.join().expect("compaction thread panicked.");
+        }
+
+        self.inner.close()?;
         Ok(())
     }
 
@@ -269,6 +285,21 @@ impl LsmStorageInner {
         self.mvcc.as_ref().unwrap()
     }
 
+    pub(crate) fn close(&self) -> Result<()> {
+        if self.options.enable_wal {
+            return Ok(());
+        }
+        if !self.state.read().memtable.is_empty() {
+            let _state_lock = self.state_lock.lock();
+            self.force_freeze_memtable(&_state_lock)?;
+        }
+
+        while !self.state.read().imm_memtables.is_empty() {
+            self.force_flush_next_imm_memtable()?;
+        }
+        Ok(())
+    }
+
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
@@ -288,6 +319,7 @@ impl LsmStorageInner {
             ),
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
+        let manifest = Manifest::create(path.join("MANIFEST"))?;
 
         let storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
@@ -296,7 +328,7 @@ impl LsmStorageInner {
             block_cache: Arc::new(BlockCache::new(1024)),
             next_sst_id: AtomicUsize::new(1),
             compaction_controller,
-            manifest: None,
+            manifest: Some(manifest),
             options: options.into(),
             mvcc: None,
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
@@ -475,7 +507,8 @@ impl LsmStorageInner {
     }
 
     pub(super) fn sync_dir(&self) -> Result<()> {
-        unimplemented!()
+        File::open(&self.path)?.sync_all()?;
+        Ok(())
     }
 
     /// Force freeze the current memtable to an immutable memtable
@@ -519,20 +552,22 @@ impl LsmStorageInner {
             let mut state_guard = self.state.write(); // we cannot afford to block here for very long time
             // replace the old state with new is just shifting pointers and not that expensive here
             let mut new_state = (**state_guard).clone();
-
-            dbg!("coming here to modify the state");
-
+            let sst = Arc::new(sst);
             new_state.imm_memtables.pop();
             if self.compaction_controller.flush_to_l0() {
                 new_state.l0_sstables.insert(0, sst.sst_id()); // O(len(l0_sstables)), not that expensive
-                new_state.sstables.insert(sst.sst_id(), Arc::new(sst));
+                new_state.sstables.insert(sst.sst_id(), sst.clone());
             } else {
                 new_state
                     .levels
                     .insert(0, (sst.sst_id(), vec![sst.sst_id()]));
-                new_state.sstables.insert(sst.sst_id(), Arc::new(sst));
+                new_state.sstables.insert(sst.sst_id(), sst.clone());
             }
 
+            self.sync_dir()?;
+            if let Some(manifest) = &self.manifest {
+                manifest.add_record(&_state_lock, ManifestRecord::Flush(sst.sst_id()))?;
+            }
             *state_guard = Arc::new(new_state); // O(1) operation
         } // write guard droppped.
         Ok(())

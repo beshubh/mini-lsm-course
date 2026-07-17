@@ -155,7 +155,7 @@ impl MemTable {
             let value = entry.value();
             builder.add(KeySlice::from_slice(key.as_ref()), value.as_ref());
         }
-        let sst = builder.build(self.id(), Some(block_cache), &path)?;
+        let sst = builder.build(self.id(), Some(block_cache), path)?;
         Ok(sst)
     }
 

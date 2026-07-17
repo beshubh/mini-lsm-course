@@ -36,6 +36,7 @@ use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -317,7 +318,7 @@ impl LsmStorageInner {
                 }
             });
 
-            new_state.levels[0].1 = new_sst_ids;
+            new_state.levels[0].1 = new_sst_ids.clone();
             for sst in &sst_to_compact {
                 new_state.sstables.remove(&sst.sst_id());
             }
@@ -325,6 +326,13 @@ impl LsmStorageInner {
                 new_state.sstables.insert(sst.sst_id(), Arc::new(sst));
             }
             *state_guard = Arc::new(new_state);
+            self.sync_dir()?;
+            if let Some(manifest) = &self.manifest {
+                manifest.add_record(
+                    &state_lock,
+                    ManifestRecord::Compaction(compaction_task, new_sst_ids),
+                )?;
+            }
         }
 
         // remove all sst_to_compact files
@@ -368,7 +376,7 @@ impl LsmStorageInner {
             deleted_ssts.iter().for_each(|sst_id| {
                 new_state.sstables.remove(sst_id);
             });
-
+            let new_sst_ids: Vec<usize> = new_ssts.iter().map(|s| s.sst_id()).collect();
             // add new generated ssts to sstables
             for sst in new_ssts {
                 new_state.sstables.insert(sst.sst_id(), Arc::new(sst));
@@ -379,6 +387,11 @@ impl LsmStorageInner {
             for sst in deleted_ssts {
                 std::fs::remove_file(self.path_of_sst(sst))
                     .context("compaction: failed to remove compacted sst, trigg")?;
+            }
+
+            self.sync_dir()?;
+            if let Some(manifest) = &self.manifest {
+                manifest.add_record(&state_lock, ManifestRecord::Compaction(task, new_sst_ids))?;
             }
         }
         Ok(())
