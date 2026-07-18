@@ -49,7 +49,13 @@ impl Manifest {
     }
 
     pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
-        let manifest = Self::create(&path)?;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(path)?;
+        let manifest = Manifest {
+            file: Arc::new(Mutex::new(f)),
+        };
         let mut records = vec![];
         let mut buf: Vec<u8> = vec![];
         manifest.file.lock().read_to_end(&mut buf)?;

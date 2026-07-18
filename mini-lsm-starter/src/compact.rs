@@ -353,7 +353,11 @@ impl LsmStorageInner {
                 let tiered_controller = TieredCompactionController::new(options.clone());
                 CompactionController::Tiered(tiered_controller)
             }
-            _ => todo!(),
+            CompactionOptions::Leveled(options) => {
+                let leveled_controller = LeveledCompactionController::new(options.clone());
+                CompactionController::Leveled(leveled_controller)
+            }
+            CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
         let snapshot = {
             let snapshot = self.state.read();
@@ -368,7 +372,10 @@ impl LsmStorageInner {
             let output = new_ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>();
             let state_lock = self.state_lock.lock();
             let mut state_guard = self.state.write();
-            let snapshot = (**state_guard).clone();
+            let mut snapshot = (**state_guard).clone();
+            for sst in new_ssts {
+                snapshot.sstables.insert(sst.sst_id(), Arc::new(sst));
+            }
             let (mut new_state, deleted_ssts) =
                 controller.apply_compaction_result(&snapshot, &task, &output, false);
 
@@ -376,11 +383,6 @@ impl LsmStorageInner {
             deleted_ssts.iter().for_each(|sst_id| {
                 new_state.sstables.remove(sst_id);
             });
-            let new_sst_ids: Vec<usize> = new_ssts.iter().map(|s| s.sst_id()).collect();
-            // add new generated ssts to sstables
-            for sst in new_ssts {
-                new_state.sstables.insert(sst.sst_id(), Arc::new(sst));
-            }
 
             *state_guard = Arc::new(new_state);
             // remove files of deleted ssts
@@ -391,7 +393,7 @@ impl LsmStorageInner {
 
             self.sync_dir()?;
             if let Some(manifest) = &self.manifest {
-                manifest.add_record(&state_lock, ManifestRecord::Compaction(task, new_sst_ids))?;
+                manifest.add_record(&state_lock, ManifestRecord::Compaction(task, output))?;
             }
         }
         Ok(())

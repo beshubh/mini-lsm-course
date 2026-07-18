@@ -18,6 +18,7 @@
 use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::key::KeySlice;
+use std::cmp::max;
 use std::collections::HashMap;
 use std::fs::File;
 use std::ops::Bound;
@@ -41,7 +42,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
+use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -300,12 +301,78 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    fn recover_from_manifest(
+        snapshot: &LsmStorageState,
+        manifest: &Manifest,
+        records: &[ManifestRecord],
+        compaction_controller: &CompactionController,
+        block_cache: Arc<BlockCache>,
+        path: impl AsRef<Path>,
+    ) -> Result<(usize, LsmStorageState)> {
+        let mut largest_id = 0usize;
+        let mut state = snapshot.clone();
+        for record in records {
+            match &record {
+                ManifestRecord::Flush(sst_id) => {
+                    largest_id = max(largest_id, *sst_id);
+                    if compaction_controller.flush_to_l0() {
+                        state.l0_sstables.insert(0, *sst_id); // O(len(l0_sstables)), not that expensive
+                    // state.sstables.insert(sst.sst_id(), sst.clone());
+                    } else {
+                        state.levels.insert(0, (*sst_id, vec![*sst_id]));
+                        // state.sstables.insert(sst.sst_id(), sst.clone());
+                    }
+                }
+                ManifestRecord::Compaction(task, sst_ids) => {
+                    let (new_state, new_sst_ids) =
+                        compaction_controller.apply_compaction_result(&state, task, sst_ids, true);
+                    state = new_state;
+
+                    if !sst_ids.is_empty() {
+                        largest_id = max(largest_id, *sst_ids.iter().max().unwrap());
+                    }
+                }
+                _ => unimplemented!(),
+            }
+        }
+        let mut sst_ids = state.l0_sstables.clone();
+        state.levels.iter().for_each(|(level_id, level_ssts)| {
+            sst_ids.extend_from_slice(level_ssts);
+        });
+
+        // open SSTs and place in sstables
+        for sst_id in sst_ids {
+            let sst = SsTable::open(
+                sst_id,
+                Some(block_cache.clone()),
+                FileObject::open(&Self::path_of_sst_static(&path, sst_id))
+                    .context("unable to open sst file while recovery")?,
+            )
+            .context("unable to open SSTable, while recovery")?;
+            state.sstables.insert(sst_id, Arc::new(sst));
+        }
+
+        // sort the SSTs across levels
+        let sstables = &state.sstables;
+        for (level_id, level_sst) in &mut state.levels {
+            level_sst.sort_by(|a, b| {
+                sstables
+                    .get(a)
+                    .unwrap()
+                    .first_key()
+                    .cmp(sstables.get(b).unwrap().first_key())
+            });
+        }
+        Ok((largest_id, state))
+    }
+
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
         let state = LsmStorageState::create(&options);
+        let block_cache = Arc::new(BlockCache::new(1024));
 
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
@@ -319,19 +386,54 @@ impl LsmStorageInner {
             ),
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
-        let manifest = Manifest::create(path.join("MANIFEST"))?;
 
-        let storage = Self {
+        let mut storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
             state_lock: Mutex::new(()),
             path: path.to_path_buf(),
-            block_cache: Arc::new(BlockCache::new(1024)),
+            block_cache: block_cache.clone(),
             next_sst_id: AtomicUsize::new(1),
             compaction_controller,
-            manifest: Some(manifest),
+            manifest: None,
             options: options.into(),
             mvcc: None,
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
+        };
+        let manifest_path = path.join("MANIFEST");
+        let snapshot = {
+            let s = storage.state.read();
+            s.clone()
+        };
+        match manifest_path.exists() {
+            true => {
+                let (mf, records) =
+                    Manifest::recover(manifest_path).context("recover from manifest")?;
+                let (largest_sst_id, mut new_state) = Self::recover_from_manifest(
+                    &snapshot,
+                    &mf,
+                    &records,
+                    &storage.compaction_controller,
+                    block_cache.clone(),
+                    path,
+                )
+                .context("failed recovering from manifest")?;
+                // load the largest_sst_id
+                storage
+                    .next_sst_id
+                    .store(largest_sst_id + 1, std::sync::atomic::Ordering::SeqCst);
+                // assign to next_sst_id to the new memtable
+                let memtable = MemTable::create(storage.next_sst_id());
+
+                // apply memtable to the state
+                new_state.memtable = Arc::new(memtable);
+                let mut state_guard = storage.state.write();
+                *state_guard = Arc::new(new_state);
+                storage.manifest = Some(mf);
+            }
+            false => {
+                storage.manifest =
+                    Some(Manifest::create(manifest_path).context("create manifest failed")?);
+            }
         };
 
         Ok(storage)
