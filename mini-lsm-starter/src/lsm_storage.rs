@@ -288,6 +288,7 @@ impl LsmStorageInner {
 
     pub(crate) fn close(&self) -> Result<()> {
         if self.options.enable_wal {
+            self.sync()?;
             return Ok(());
         }
         if !self.state.read().memtable.is_empty() {
