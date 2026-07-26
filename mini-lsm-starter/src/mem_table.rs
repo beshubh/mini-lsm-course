@@ -25,7 +25,7 @@ use crate::key::KeySlice;
 use crate::lsm_storage::BlockCache;
 use crate::table::{SsTable, SsTableBuilder};
 use crate::wal::Wal;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
@@ -62,8 +62,14 @@ impl MemTable {
     }
 
     /// Create a new mem-table with WAL
-    pub fn create_with_wal(_id: usize, _path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+    pub fn create_with_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
+        let wal = Wal::create(&path)?;
+        Ok(Self {
+            map: Arc::new(SkipMap::new()),
+            wal: Some(wal),
+            id,
+            approximate_size: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     /// Create a memtable from WAL
@@ -107,9 +113,13 @@ impl MemTable {
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let keylen = key.len();
         let valuelen = value.len();
-        let key = Bytes::copy_from_slice(key);
-        let value = Bytes::copy_from_slice(value);
-        self.map.insert(key, value);
+        let k = Bytes::copy_from_slice(key);
+        let v = Bytes::copy_from_slice(value);
+
+        if let Some(wal) = &self.wal {
+            wal.put(key, value).context("error persisting put to wal")?;
+        }
+        self.map.insert(k, v);
         let size = keylen + valuelen;
         self.approximate_size
             .fetch_add(size, std::sync::atomic::Ordering::Relaxed);

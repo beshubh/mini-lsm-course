@@ -317,10 +317,8 @@ impl LsmStorageInner {
                     largest_id = max(largest_id, *sst_id);
                     if compaction_controller.flush_to_l0() {
                         state.l0_sstables.insert(0, *sst_id); // O(len(l0_sstables)), not that expensive
-                    // state.sstables.insert(sst.sst_id(), sst.clone());
                     } else {
                         state.levels.insert(0, (*sst_id, vec![*sst_id]));
-                        // state.sstables.insert(sst.sst_id(), sst.clone());
                     }
                 }
                 ManifestRecord::Compaction(task, sst_ids) => {
@@ -365,13 +363,12 @@ impl LsmStorageInner {
         }
         Ok((largest_id, state))
     }
-
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
-        let state = LsmStorageState::create(&options);
+        let mut state = LsmStorageState::create(&options);
         let block_cache = Arc::new(BlockCache::new(1024));
 
         let compaction_controller = match &options.compaction_options {
@@ -386,7 +383,6 @@ impl LsmStorageInner {
             ),
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
-
         let mut storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
             state_lock: Mutex::new(()),
@@ -422,17 +418,46 @@ impl LsmStorageInner {
                     .next_sst_id
                     .store(largest_sst_id + 1, std::sync::atomic::Ordering::SeqCst);
                 // assign to next_sst_id to the new memtable
-                let memtable = MemTable::create(storage.next_sst_id());
+                let memtable_id = storage.next_sst_id();
+                let memtable = match storage.options.enable_wal {
+                    true => Arc::new(MemTable::create_with_wal(
+                        memtable_id,
+                        Self::path_of_wal_static(path, memtable_id),
+                    )?),
+                    false => Arc::new(MemTable::create(memtable_id)),
+                };
+
+                mf.add_record(
+                    &storage.state_lock.lock(),
+                    ManifestRecord::NewMemtable(memtable_id),
+                )?;
 
                 // apply memtable to the state
-                new_state.memtable = Arc::new(memtable);
+                new_state.memtable = memtable;
                 let mut state_guard = storage.state.write();
                 *state_guard = Arc::new(new_state);
                 storage.manifest = Some(mf);
             }
             false => {
-                storage.manifest =
-                    Some(Manifest::create(manifest_path).context("create manifest failed")?);
+                let memtable_id = 0;
+                let memtable = match storage.options.enable_wal {
+                    true => Arc::new(MemTable::create_with_wal(
+                        memtable_id,
+                        Self::path_of_wal_static(path, memtable_id),
+                    )?),
+                    false => Arc::new(MemTable::create(memtable_id)),
+                };
+                let mf = Manifest::create(manifest_path).context("create manifest failed")?;
+                mf.add_record(
+                    &storage.state_lock.lock(),
+                    ManifestRecord::NewMemtable(memtable_id),
+                )?;
+
+                let mut state_guard = storage.state.write();
+                let mut new_state = (**state_guard).clone();
+                new_state.memtable = memtable;
+                *state_guard = Arc::new(new_state);
+                storage.manifest = Some(mf)
             }
         };
 
@@ -617,7 +642,23 @@ impl LsmStorageInner {
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
         // if this was WAL it could have taken certain miliseconds to get created
         // But as we are not yet locking the state with write, its not an issue for us.
-        let new_memtable = Arc::new(MemTable::create(self.next_sst_id()));
+        let memtable_id = self.next_sst_id();
+        let new_memtable = match self.options.enable_wal {
+            true => Arc::new(MemTable::create_with_wal(
+                memtable_id,
+                self.path_of_wal(memtable_id),
+            )?),
+            false => Arc::new(MemTable::create(memtable_id)),
+        };
+
+        if let Some(mf) = &self.manifest {
+            mf.add_record(
+                _state_lock_observer,
+                ManifestRecord::NewMemtable(memtable_id),
+            )
+            .context("adding newmemtable to manifest, on force_freeze_memtable")?;
+        }
+
         {
             let mut state_guard = self.state.write();
             let mut new_state = (**state_guard).clone();
