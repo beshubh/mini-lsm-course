@@ -19,7 +19,7 @@ use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::key::KeySlice;
 use std::cmp::max;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -330,7 +330,9 @@ impl LsmStorageInner {
                         largest_id = max(largest_id, *sst_ids.iter().max().unwrap());
                     }
                 }
-                _ => unimplemented!(),
+                ManifestRecord::NewMemtable(memtable_id) => {
+                    largest_id = max(largest_id, *memtable_id);
+                }
             }
         }
         let mut sst_ids = state.l0_sstables.clone();
@@ -349,7 +351,6 @@ impl LsmStorageInner {
             .context("unable to open SSTable, while recovery")?;
             state.sstables.insert(sst_id, Arc::new(sst));
         }
-
         // sort the SSTs across levels
         let sstables = &state.sstables;
         for (level_id, level_sst) in &mut state.levels {
@@ -363,12 +364,41 @@ impl LsmStorageInner {
         }
         Ok((largest_id, state))
     }
+
+    fn recover_from_wal(
+        manifest_records: &[ManifestRecord],
+        path: impl AsRef<Path>,
+    ) -> Result<Vec<Arc<MemTable>>> {
+        let mut unflushed_memtables = BTreeSet::new();
+        manifest_records.iter().for_each(|record| match &record {
+            ManifestRecord::NewMemtable(memtable_id) => {
+                unflushed_memtables.insert(*memtable_id);
+            }
+            ManifestRecord::Flush(memtable_id) => {
+                unflushed_memtables.remove(memtable_id);
+            }
+            _ => {}
+        });
+        if unflushed_memtables.is_empty() {
+            return Ok(vec![]);
+        }
+        let largest_memtable = unflushed_memtables.iter().max().unwrap();
+        let mut memtables = vec![];
+        for memtable in unflushed_memtables.iter().rev() {
+            memtables.push(Arc::new(MemTable::recover_from_wal(
+                *memtable,
+                Self::path_of_wal_static(&path, *memtable),
+            )?));
+        }
+        Ok(memtables)
+    }
+
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
-        let mut state = LsmStorageState::create(&options);
+        let state = LsmStorageState::create(&options);
         let block_cache = Arc::new(BlockCache::new(1024));
 
         let compaction_controller = match &options.compaction_options {
@@ -431,7 +461,10 @@ impl LsmStorageInner {
                     &storage.state_lock.lock(),
                     ManifestRecord::NewMemtable(memtable_id),
                 )?;
-
+                if storage.options.enable_wal {
+                    let imm_memtables = Self::recover_from_wal(&records, path)?;
+                    new_state.imm_memtables = imm_memtables;
+                }
                 // apply memtable to the state
                 new_state.memtable = memtable;
                 let mut state_guard = storage.state.write();
@@ -465,7 +498,7 @@ impl LsmStorageInner {
     }
 
     pub fn sync(&self) -> Result<()> {
-        unimplemented!()
+        self.state.read().memtable.sync_wal()
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
@@ -663,6 +696,7 @@ impl LsmStorageInner {
             let mut state_guard = self.state.write();
             let mut new_state = (**state_guard).clone();
             let old_memtable = new_state.memtable.clone();
+            old_memtable.sync_wal()?;
             new_state.imm_memtables.insert(0, old_memtable);
             new_state.memtable = new_memtable;
             *state_guard = Arc::new(new_state);

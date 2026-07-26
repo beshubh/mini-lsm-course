@@ -15,6 +15,7 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
@@ -60,9 +61,19 @@ impl Manifest {
         let mut buf: Vec<u8> = vec![];
         manifest.file.lock().read_to_end(&mut buf)?;
         let stream = serde_json::Deserializer::from_slice(&buf).into_iter::<ManifestRecord>();
+        let mut unflushed_memtables = HashSet::new();
         for res in stream {
             match res {
                 Ok(record) => {
+                    match &record {
+                        ManifestRecord::NewMemtable(memtable_id) => {
+                            unflushed_memtables.insert(*memtable_id);
+                        }
+                        ManifestRecord::Flush(memtable_id) => {
+                            unflushed_memtables.remove(memtable_id);
+                        }
+                        _ => {}
+                    }
                     records.push(record);
                 }
                 Err(e) => return Err(e.into()),
