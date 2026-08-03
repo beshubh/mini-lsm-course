@@ -15,7 +15,7 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use bytes::BufMut;
 use bytes::Bytes;
 use crc32fast::Hasher;
@@ -64,20 +64,30 @@ impl Wal {
             .open(&path)
             .context("wal recover: walfile does not exists")?;
         loop {
-            let mut length_buf = [0u8; 4];
+            let mut keylen_buf = [0u8; 4];
             let bytes_read = file
-                .read(&mut length_buf)
+                .read(&mut keylen_buf)
                 .context("reading payload length while recovering WAL")?;
             if bytes_read == 0 {
                 break;
             }
-            if bytes_read < length_buf.len() {
-                file.read_exact(&mut length_buf[bytes_read..])
+            if bytes_read < keylen_buf.len() {
+                file.read_exact(&mut keylen_buf[bytes_read..])
                     .context("truncated payload length in WAL")?;
             }
 
-            // `put` writes all integers in big-endian order.
-            let length = u32::from_be_bytes(length_buf) as usize;
+            let keylen = u32::from_be_bytes(keylen_buf) as usize;
+            let mut key = vec![0u8; keylen];
+            file.read_exact(&mut key)
+                .context("walfile truncated reading key")?;
+
+            let mut valuelen_buf = [0u8; 4];
+            file.read_exact(&mut valuelen_buf)
+                .context("walfile truncated reading value length")?;
+            let valuelen = u32::from_be_bytes(valuelen_buf) as usize;
+            let mut value = vec![0u8; valuelen];
+            file.read_exact(&mut value)
+                .context("walfile truncated reading value")?;
 
             let mut crc_buf = [0u8; 4];
             file.read_exact(&mut crc_buf)
@@ -86,45 +96,20 @@ impl Wal {
 
             // `with_capacity` alone creates an empty vector, so there would be
             // no bytes for `read_exact` to fill.
-            let mut payload = vec![0u8; length];
-            file.read_exact(&mut payload)
-                .context("reading payload while recovering WAL")?;
+            let length = 8 + key.len() + value.len();
+            let mut payload = Vec::with_capacity(length);
+            payload.extend_from_slice(&keylen_buf);
+            payload.extend_from_slice(&key);
+            payload.extend_from_slice(&valuelen_buf);
+            payload.extend_from_slice(&value);
 
-            let actual_crc = Self::checksum(&payload);
+            let actual_crc = crc32fast::hash(&payload);
             if actual_crc != expected_crc {
                 bail!("WAL record checksum failed");
             }
 
-            ensure!(payload.len() >= 8, "WAL record payload is too short");
-
-            let key_len = u32::from_be_bytes(payload[..4].try_into()?) as usize;
-            let key_start = 4usize;
-            let key_end = key_start
-                .checked_add(key_len)
-                .context("key length overflows WAL record size")?;
-            let value_length_end = key_end
-                .checked_add(4)
-                .context("key length overflows WAL record size")?;
-            ensure!(
-                value_length_end <= payload.len(),
-                "invalid key length in WAL record"
-            );
-
-            let value_len =
-                u32::from_be_bytes(payload[key_end..value_length_end].try_into()?) as usize;
-            let value_start = value_length_end;
-            let value_end = value_start
-                .checked_add(value_len)
-                .context("value length overflows WAL record size")?;
-            ensure!(
-                value_end == payload.len(),
-                "invalid value length in WAL record"
-            );
-
-            // Copy the slices because `payload` is dropped at the end of this
-            // iteration, while entries in the skiplist must own their bytes.
-            let key = Bytes::copy_from_slice(&payload[key_start..key_end]);
-            let value = Bytes::copy_from_slice(&payload[value_start..value_end]);
+            let key = Bytes::copy_from_slice(&key);
+            let value = Bytes::copy_from_slice(&value);
             skiplist.insert(key, value);
         }
         Ok(Wal {
@@ -133,22 +118,17 @@ impl Wal {
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        // [[....]=length, [....]=crc, [... length bytes for payload]]
+        // [[...bytes for payload] | [....]=crc]
         let mut payload = vec![];
         payload.put_u32(key.len() as u32);
         payload.extend_from_slice(key);
         payload.put_u32(value.len() as u32);
         payload.extend_from_slice(value);
-        let length = payload.len() as u32;
-        let crc = Self::checksum(&payload);
-        let mut record = Vec::with_capacity((8u32 + length) as usize);
-        record.extend_from_slice(&length.to_be_bytes());
-        record.extend_from_slice(&crc.to_be_bytes());
-        record.extend_from_slice(&payload);
-
+        let crc = crc32fast::hash(&payload);
+        payload.put_u32(crc);
         self.file
             .lock()
-            .write_all(&record)
+            .write_all(&payload)
             .context("unable to `put` to walfile")?;
         Ok(())
     }
