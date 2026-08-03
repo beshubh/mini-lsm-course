@@ -91,7 +91,7 @@ impl SsTableBuilder {
         }
 
         let pos = self.data.len();
-        // Slit to a new block and clear older first and last keys
+        // Split to a new block and clear older first and last keys
         let current_builder =
             std::mem::replace(&mut self.builder, BlockBuilder::new(self.block_size));
 
@@ -105,7 +105,11 @@ impl SsTableBuilder {
             last_key: last_key.into_key_bytes(),
             offset: pos,
         };
-        self.data.extend_from_slice(&curr_block.encode());
+        let encoded_block = curr_block.encode();
+        let checksum = crc32fast::hash(&encoded_block);
+        self.data.extend_from_slice(&encoded_block);
+        // TODO: put the checksum of the block after
+        self.data.put_u32(checksum);
         self.meta.push(block_meta);
     }
 

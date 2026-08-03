@@ -19,7 +19,36 @@ use bytes::BufMut;
 
 use super::Block;
 use crate::key::{KeySlice, KeyVec};
-/// Builds a block.
+
+/// Builds the data and offset sections of an encoded block.
+///
+/// Once [`Block::encode`] appends the offset table and entry count, the on-disk
+/// representation looks like this (all integers are big-endian):
+///
+/// ```text
+/// low address                                                        high address
+///     |                                                                    |
+///     v                                                                    v
+/// +--------------------- data ---------------------+------ offsets ------+-------+
+/// | entry 0 | entry 1 | ... | entry n-1           | off 0 | ... | off n-1| count |
+/// +---------+---------+-----+----------------------+-------+-----+--------+-------+
+///                                                     u16    ...    u16      u16
+///
+/// Each offset is measured from the start of the data section and points to
+/// the corresponding entry. Each entry has this variable-length layout:
+///
+/// +-------------------+-----------------+----------+-----------------+-------+
+/// | overlap_len (u16) | suffix_len (u16) | suffix  | value_len (u16) | value |
+/// +-------------------+-----------------+----------+-----------------+-------+
+///                                         N bytes                       M bytes
+///
+/// full_key = first_key[..overlap_len] + suffix
+/// N = suffix_len, M = value_len
+/// ```
+///
+/// Entry 0 stores the whole first key (`overlap_len = 0`). Later entries are
+/// prefix-compressed against that first key, rather than against the previous
+/// entry.
 pub struct BlockBuilder {
     /// Offsets of each key-value entries.
     offsets: Vec<u16>,

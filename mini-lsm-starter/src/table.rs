@@ -122,7 +122,8 @@ impl FileObject {
         self.0
             .as_ref()
             .unwrap()
-            .read_exact_at(&mut data[..], offset)?;
+            .read_exact_at(&mut data[..], offset)
+            .context("fileobject: read_exact_at failed")?;
         Ok(data)
     }
 
@@ -263,8 +264,20 @@ impl SsTable {
         } else {
             self.block_meta_offset - block_meta.offset
         };
+        // this contains both the block data and checksum
         let data = self.file.read(block_meta.offset as u64, block_len as u64)?;
-        let block = Block::decode(&data);
+        // checksum is last 4 bytes.
+        let (data, checksum_bytes) = (&data[..data.len() - 4], &data[data.len() - 4..]);
+        let expected = u32::from_be_bytes(
+            checksum_bytes
+                .try_into()
+                .expect("checksum must contain 4 bytes"),
+        );
+        let actual_checksum = crc32fast::hash(data);
+        if actual_checksum != expected {
+            bail!("corrupted data: expected checksum do not match with computed one");
+        }
+        let block = Block::decode(data);
         Ok(Arc::new(block))
     }
 
