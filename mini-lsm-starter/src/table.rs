@@ -65,6 +65,7 @@ impl BlockMeta {
     /// You may add extra fields to the buffer,
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
     pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>) {
+        let bm_starting_offset = buf.len();
         buf.put_u32(block_meta.len().try_into().unwrap());
         for bm in block_meta {
             buf.put_u32(bm.offset as u32);
@@ -73,6 +74,8 @@ impl BlockMeta {
             buf.put_u16(bm.last_key.len().try_into().unwrap());
             buf.put_slice(bm.last_key.raw_ref());
         }
+        let checksum = crc32fast::hash(&buf[bm_starting_offset..]);
+        buf.put_u32(checksum);
     }
 
     /// Decode block meta from a buffer.
@@ -81,6 +84,23 @@ impl BlockMeta {
             buf.remaining() >= 4,
             "block meta buffer too small to contain metadata count"
         );
+        let bytes = buf.copy_to_bytes(buf.remaining());
+        let (payload, checksum_bytes) = bytes.split_at(bytes.len() - 4);
+        let actual = crc32fast::hash(payload);
+        let expected = u32::from_be_bytes(
+            checksum_bytes
+                .try_into()
+                .expect("blockmeta: checksum should be of 4 bytes"),
+        );
+        if expected != actual {
+            // TODO: won't this leave database in an unrecoverable state?
+            panic!(
+                "blockmeta: data corrupted, expected and actual checksum do not match, expected: {}, actual: {}",
+                expected, actual
+            )
+        }
+
+        let mut buf = payload;
         let num_block_metas = buf.get_u32() as usize;
         let mut metas = Vec::with_capacity(num_block_metas);
         for _ in 0..num_block_metas {
@@ -199,8 +219,12 @@ impl SsTable {
             bail!("invalid block meta offset, SsTable::open");
         }
         if block_meta_offset > bloom_offset - 4 {
-            bail!("blokc meta offset is greater than bloom offset - 4, SsTable::open");
+            bail!("block meta offset is greater than bloom offset - 4, SsTable::open");
         }
+        // meta offset = x
+        // bloom offset = y
+        // x & y itself are u32 so 4 minus is being done
+        // ......x....y....
         let meta_bytes_length = bloom_offset - 4 - block_meta_offset;
 
         let meta_bytes = file.read(block_meta_offset as u64, meta_bytes_length as u64)?;

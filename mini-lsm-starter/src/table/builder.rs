@@ -141,11 +141,13 @@ impl SsTableBuilder {
 
         // encode block meta
         BlockMeta::encode_block_meta(&self.meta, &mut self.data);
+        // TODO: add checksum for the block meta section
         self.data.put_u32(meta_offset.try_into().unwrap());
 
         // encode bloom filter
         let bloom_offset = self.data.len();
         bloom_filter.encode(&mut self.data);
+        // TODO: add checksum for bloom filter
         self.data.put_u32(bloom_offset.try_into().unwrap());
         // flush
         file.write_all(&self.data)?;
