@@ -30,6 +30,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::key::KeyBytes;
 use crate::key::KeySlice;
 
 pub struct Wal {
@@ -57,7 +58,7 @@ impl Wal {
         hasher.finalize()
     }
 
-    pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<Bytes, Bytes>) -> Result<Self> {
+    pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<KeyBytes, Bytes>) -> Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -80,6 +81,10 @@ impl Wal {
             let mut key = vec![0u8; keylen];
             file.read_exact(&mut key)
                 .context("walfile truncated reading key")?;
+            let mut ts_buf = [0u8; 8];
+            file.read_exact(&mut ts_buf)
+                .context("walfile truncated, reading key ts")?;
+            let key_ts = u64::from_be_bytes(ts_buf);
 
             let mut valuelen_buf = [0u8; 4];
             file.read_exact(&mut valuelen_buf)
@@ -100,6 +105,7 @@ impl Wal {
             let mut payload = Vec::with_capacity(length);
             payload.extend_from_slice(&keylen_buf);
             payload.extend_from_slice(&key);
+            payload.extend_from_slice(&ts_buf);
             payload.extend_from_slice(&valuelen_buf);
             payload.extend_from_slice(&value);
 
@@ -108,7 +114,7 @@ impl Wal {
                 bail!("WAL record checksum failed");
             }
 
-            let key = Bytes::copy_from_slice(&key);
+            let key = KeyBytes::from_bytes_with_ts(Bytes::from(key), key_ts);
             let value = Bytes::copy_from_slice(&value);
             skiplist.insert(key, value);
         }
@@ -117,11 +123,12 @@ impl Wal {
         })
     }
 
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
         // [[...bytes for payload] | [....]=crc]
         let mut payload = vec![];
-        payload.put_u32(key.len() as u32);
-        payload.extend_from_slice(key);
+        payload.put_u32(key.key_len() as u32);
+        payload.extend_from_slice(key.key_ref());
+        payload.put_u64(key.ts());
         payload.put_u32(value.len() as u32);
         payload.extend_from_slice(value);
         let crc = crc32fast::hash(&payload);

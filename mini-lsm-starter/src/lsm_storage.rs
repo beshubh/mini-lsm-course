@@ -17,7 +17,7 @@
 
 use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
-use crate::key::{KeySlice, TS_RANGE_BEGIN};
+use crate::key::{KeySlice, TS_RANGE_BEGIN, TS_RANGE_END};
 use std::cmp::max;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
@@ -40,11 +40,19 @@ use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
-use crate::mem_table::{MemTable, map_bound};
+use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
 use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
+
+fn map_user_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
+    match bound {
+        Bound::Included(key) => Bound::Included(Bytes::copy_from_slice(key)),
+        Bound::Excluded(key) => Bound::Excluded(Bytes::copy_from_slice(key)),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
 
 /// Represents the state of the storage engine.
 #[derive(Clone)]
@@ -423,7 +431,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: None,
             options: options.into(),
-            mvcc: None,
+            mvcc: Some(LsmMvccInner::new(0)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
         let manifest_path = path.join("MANIFEST");
@@ -513,57 +521,57 @@ impl LsmStorageInner {
             let guard = self.state.read();
             Arc::clone(&guard)
         };
-        // scan the current memtable
-        let val = state.memtable.get(key);
-        if let Some(val) = val {
-            // TOMBSTONE check
-            if val.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(val));
-        }
+        let key = KeySlice::from_slice(key, TS_RANGE_BEGIN);
+        let memtable_iter = state.memtable.scan(Bound::Included(key), Bound::Unbounded);
         // Scan frozen memtables
+        let mut memtable_iters = vec![Box::new(memtable_iter)];
         for memtable in state.imm_memtables.iter() {
-            let val = memtable.get(key);
-
-            if let Some(val) = val {
-                // TOMBSTONE check
-                if val.is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(val));
-            }
+            memtable_iters.push(Box::new(
+                memtable.scan(Bound::Included(key), Bound::Unbounded),
+            ))
         }
-        let key_slice = KeySlice::from_slice(key, TS_RANGE_BEGIN);
+        let mut sst_iters = vec![];
         for sst in &state.l0_sstables {
             let ss_table = state.sstables.get(sst);
             let Some(st) = ss_table else {
                 bail!("SsTable does not exist in LsmState, should be impossible!");
             };
-            let key_hash = farmhash::fingerprint32(key);
+            let key_hash = farmhash::fingerprint32(key.key_ref());
             if let Some(bloom) = &st.bloom
                 && bloom.may_contain(key_hash)
             {
-                let sst_iter = SsTableIterator::create_and_seek_to_key(st.clone(), key_slice)?;
-                if sst_iter.key().key_ref() == key_slice.key_ref() {
-                    let val = sst_iter.value();
-                    if val.is_empty() {
-                        return Ok(None);
-                    }
-                    return Ok(Some(Bytes::copy_from_slice(val)));
-                }
+                let sst_iter = SsTableIterator::create_and_seek_to_key(st.clone(), key)?;
+                sst_iters.push(Box::new(sst_iter));
             }
         }
+        let merge_iterator = TwoMergeIterator::create(
+            MergeIterator::create(memtable_iters),
+            MergeIterator::create(sst_iters),
+        )
+        .context("create two merge iterator from memtables and l0_sst for get")?;
         // compacted levels
-        self.get_from_levels(&state, key, key_slice)
+        let sst_iter = self.get_from_levels(&state, key)?;
+        let global_iter = TwoMergeIterator::create(merge_iterator, sst_iter)?;
+        if !global_iter.is_valid() {
+            return Ok(None);
+        }
+        if global_iter.key().key_ref() == key.key_ref() {
+            // TOMBSTONE check
+            if global_iter.value().is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(Bytes::copy_from_slice(global_iter.value())));
+        }
+
+        Ok(None)
     }
 
     fn get_from_levels(
         &self,
         state: &LsmStorageState,
-        key: &[u8],
-        key_slice: KeySlice<'_>,
-    ) -> Result<Option<Bytes>> {
+        key: KeySlice<'_>,
+    ) -> Result<MergeIterator<SsTableIterator>> {
+        let mut iters = vec![];
         for (_, level_sst_ids) in &state.levels {
             let mut left = 0;
             let mut right = level_sst_ids.len();
@@ -572,7 +580,7 @@ impl LsmStorageInner {
                 let Some(table) = state.sstables.get(&level_sst_ids[mid]) else {
                     bail!("SsTable does not exist in LsmState, should be impossible!");
                 };
-                if table.last_key().key_ref() < key {
+                if table.last_key().key_ref() < key.key_ref() {
                     left = mid + 1;
                 } else {
                     right = mid;
@@ -585,49 +593,53 @@ impl LsmStorageInner {
             let Some(st) = state.sstables.get(sst_id) else {
                 bail!("SsTable does not exist in LsmState, should be impossible!");
             };
-            if key < st.first_key().key_ref() {
+            if key.key_ref() < st.first_key().key_ref() {
                 continue;
             }
-            let key_hash = farmhash::fingerprint32(key);
+            let key_hash = farmhash::fingerprint32(key.key_ref());
             if let Some(bloom) = &st.bloom
                 && !bloom.may_contain(key_hash)
             {
                 continue;
             }
-            let sst_iter = SsTableIterator::create_and_seek_to_key(st.clone(), key_slice)?;
-            if sst_iter.is_valid() && sst_iter.key().key_ref() == key_slice.key_ref() {
-                let val = sst_iter.value();
-                if val.is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(Bytes::copy_from_slice(val)));
-            }
+            let sst_iter = SsTableIterator::create_and_seek_to_key(st.clone(), key)?;
+            iters.push(Box::new(sst_iter));
         }
-        Ok(None)
+        Ok(MergeIterator::create(iters))
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        let mvcc = self.mvcc();
+        let guard = mvcc.write_lock.lock();
         let state = {
             let g = self.state.read();
             Arc::clone(&g)
         };
+        // intentially crash if mvcc is not there
+        let commit_ts = mvcc.latest_commit_ts() + 1;
         for record in batch {
             match record {
                 WriteBatchRecord::Put(key, value) => {
                     state
                         .memtable
-                        .put(key.as_ref(), value.as_ref())
+                        .put(
+                            KeySlice::from_slice(key.as_ref(), commit_ts),
+                            value.as_ref(),
+                        )
                         .with_context(|| {
                             format!("write batch handling put failed, key: {:?}", key.as_ref())
                         })?;
                 }
                 WriteBatchRecord::Del(key) => {
-                    state.memtable.put(key.as_ref(), &[])?; // TOMBSTONE
+                    state
+                        .memtable
+                        .put(KeySlice::from_slice(key.as_ref(), commit_ts), &[])?; // TOMBSTONE
                 }
             }
         }
         self.check_and_freeze_if_necessary(state)?;
+        mvcc.update_commit_ts(commit_ts);
         Ok(())
     }
 
@@ -764,10 +776,10 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    fn create_sst_iters(
+    fn create_l0sst_iters(
         &self,
-        lower: Bound<&[u8]>,
-        upper: Bound<&[u8]>,
+        lower: Bound<KeySlice>,
+        upper: Bound<KeySlice>,
         snapshot: &LsmStorageState,
     ) -> Result<Vec<Box<SsTableIterator>>> {
         let mut sst_iters = vec![];
@@ -785,8 +797,8 @@ impl LsmStorageInner {
             let first_key = table.first_key().key_ref();
             let last_key = table.last_key().key_ref();
             let skip_for_lower = match lower {
-                Bound::Included(target) => last_key < target,
-                Bound::Excluded(target) => last_key <= target,
+                Bound::Included(target) => last_key < target.key_ref(),
+                Bound::Excluded(target) => last_key <= target.key_ref(),
                 Bound::Unbounded => false,
             };
             if skip_for_lower {
@@ -794,8 +806,8 @@ impl LsmStorageInner {
             }
 
             let skip_for_upper = match upper {
-                Bound::Included(target) => first_key > target,
-                Bound::Excluded(target) => first_key >= target,
+                Bound::Included(target) => first_key > target.key_ref(),
+                Bound::Excluded(target) => first_key >= target.key_ref(),
                 Bound::Unbounded => false,
             };
 
@@ -805,17 +817,14 @@ impl LsmStorageInner {
 
             let mut sst_iter = match lower {
                 Bound::Included(key) | Bound::Excluded(key) => {
-                    SsTableIterator::create_and_seek_to_key(
-                        table,
-                        KeySlice::from_slice(key, TS_RANGE_BEGIN),
-                    )?
+                    SsTableIterator::create_and_seek_to_key(table, key)?
                 }
                 Bound::Unbounded => SsTableIterator::create_and_seek_to_first(table)?,
             };
 
             if let Bound::Excluded(key) = lower
                 && sst_iter.is_valid()
-                && sst_iter.key().key_ref() == key
+                && sst_iter.key().key_ref() == key.key_ref()
             {
                 sst_iter.next()?;
             }
@@ -854,7 +863,9 @@ impl LsmStorageInner {
             && iter.is_valid()
             && iter.key().key_ref() == key
         {
-            iter.next()?;
+            while iter.is_valid() && iter.key().key_ref() == key {
+                iter.next()?;
+            }
         }
         Ok(iter)
     }
@@ -872,22 +883,39 @@ impl LsmStorageInner {
     /// Create an iterator over a range of keys.
     pub fn scan(
         &self,
-        lower: Bound<&[u8]>,
-        upper: Bound<&[u8]>,
+        user_lower: Bound<&[u8]>,
+        user_upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
         };
+        // v: u64::MAX
+        // apple@10
+        // apple@9
+        // apple@8
+        // v: u64::MIN
+        let internal_lower = match user_lower {
+            Bound::Excluded(b) => Bound::Excluded(KeySlice::from_slice(b, TS_RANGE_END)),
+            Bound::Included(b) => Bound::Included(KeySlice::from_slice(b, TS_RANGE_BEGIN)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let internal_upper = match user_upper {
+            Bound::Excluded(b) => Bound::Excluded(KeySlice::from_slice(b, TS_RANGE_BEGIN)),
+            Bound::Included(b) => Bound::Included(KeySlice::from_slice(b, TS_RANGE_END)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
         // in memory iterators
         let mut memtables = vec![];
-        memtables.push(Box::new(snapshot.memtable.scan(lower, upper)));
+        memtables.push(Box::new(
+            snapshot.memtable.scan(internal_lower, internal_upper),
+        ));
         snapshot.imm_memtables.iter().for_each(|imm| {
-            memtables.push(Box::new(imm.scan(lower, upper)));
+            memtables.push(Box::new(imm.scan(internal_lower, internal_upper)));
         });
 
         // l0 sst iterators
-        let sst_iters = self.create_sst_iters(lower, upper, &snapshot)?;
+        let sst_iters = self.create_l0sst_iters(internal_lower, internal_upper, &snapshot)?;
         let mem_merge_iters = MergeIterator::create(memtables);
         let sst_merge_iters = MergeIterator::create(sst_iters);
         let mem_iters_and_l0_sst_iters =
@@ -898,13 +926,14 @@ impl LsmStorageInner {
             level_iters.push(Box::new(self.create_concat_iters(
                 &snapshot,
                 level_sst_ids,
-                lower,
-                upper,
+                user_lower,
+                user_upper,
             )?));
         }
         let level_merge_iter = MergeIterator::create(level_iters);
         let inner = TwoMergeIterator::create(mem_iters_and_l0_sst_iters, level_merge_iter)?;
-        let iter = LsmIterator::new(inner, map_bound(upper).clone())?;
+
+        let iter = LsmIterator::new(inner, map_user_bound(user_upper))?;
         Ok(FusedIterator::new(iter))
     }
 }
