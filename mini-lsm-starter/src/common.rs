@@ -11,14 +11,14 @@ pub(crate) fn overlapping_sst_range(
     upper: Bound<&[u8]>,
 ) -> Range<usize> {
     let start = sstables.partition_point(|sst| match lower {
-        Bound::Included(key) => sst.last_key().raw_ref() < key,
-        Bound::Excluded(key) => sst.last_key().raw_ref() <= key,
+        Bound::Included(key) => sst.last_key().key_ref() < key,
+        Bound::Excluded(key) => sst.last_key().key_ref() <= key,
         Bound::Unbounded => false,
     });
 
     let end = sstables.partition_point(|sst| match upper {
-        Bound::Included(key) => sst.first_key().raw_ref() <= key,
-        Bound::Excluded(key) => sst.first_key().raw_ref() < key,
+        Bound::Included(key) => sst.first_key().key_ref() <= key,
+        Bound::Excluded(key) => sst.first_key().key_ref() < key,
         Bound::Unbounded => true,
     });
 

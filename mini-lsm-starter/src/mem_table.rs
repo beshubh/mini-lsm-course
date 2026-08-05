@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use crate::iterators::StorageIterator;
-use crate::key::KeySlice;
+use crate::key::{KeySlice, TS_DEFAULT};
 use crate::lsm_storage::BlockCache;
 use crate::table::{SsTable, SsTableBuilder};
 use crate::wal::Wal;
@@ -175,7 +175,10 @@ impl MemTable {
         for entry in self.map.iter() {
             let key = entry.key();
             let value = entry.value();
-            builder.add(KeySlice::from_slice(key.as_ref()), value.as_ref());
+            builder.add(
+                KeySlice::from_slice(key.as_ref(), TS_DEFAULT),
+                value.as_ref(),
+            );
         }
         let sst = builder.build(self.id(), Some(block_cache), path)?;
         Ok(sst)
@@ -224,7 +227,7 @@ impl StorageIterator for MemTableIterator {
     }
 
     fn key(&self) -> KeySlice<'_> {
-        self.with_item(|item| KeySlice::from_slice(item.0.as_ref()))
+        self.with_item(|item| KeySlice::from_slice(item.0.as_ref(), TS_DEFAULT))
     }
 
     fn is_valid(&self) -> bool {

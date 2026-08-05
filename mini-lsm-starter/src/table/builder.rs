@@ -36,7 +36,9 @@ use crate::{
 pub struct SsTableBuilder {
     builder: BlockBuilder,
     first_key: Vec<u8>,
+    first_key_ts: u64,
     last_key: Vec<u8>,
+    last_key_ts: u64,
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
@@ -50,7 +52,9 @@ impl SsTableBuilder {
         Self {
             builder: BlockBuilder::new(block_size),
             first_key: vec![],
+            first_key_ts: 0,
             last_key: vec![],
+            last_key_ts: 0,
             data: vec![],
             meta: Vec::new(),
             block_size,
@@ -69,6 +73,7 @@ impl SsTableBuilder {
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
         if self.meta.is_empty() && self.builder.is_empty() {
             self.first_key = key.to_key_vec().into_inner();
+            self.first_key_ts = key.ts();
         }
         if !self.builder.add(key, value) {
             self.finish_block();
@@ -78,11 +83,12 @@ impl SsTableBuilder {
             );
         }
         self.last_key = key.to_key_vec().into_inner();
+        self.last_key_ts = key.ts();
         self.key_hashes.push(self.hash(key));
     }
 
     fn hash(&self, key: KeySlice) -> u32 {
-        farmhash::fingerprint32(key.raw_ref())
+        farmhash::fingerprint32(key.key_ref())
     }
 
     fn finish_block(&mut self) {
@@ -156,8 +162,8 @@ impl SsTableBuilder {
             file: FileObject::open(path.as_ref())?,
             block_meta_offset: meta_offset,
             block_meta: self.meta.clone(),
-            first_key: KeyBytes::from_bytes(Bytes::from(self.first_key)),
-            last_key: KeyBytes::from_bytes(Bytes::from(self.last_key)),
+            first_key: KeyBytes::from_bytes_with_ts(Bytes::from(self.first_key), self.first_key_ts),
+            last_key: KeyBytes::from_bytes_with_ts(Bytes::from(self.last_key), self.last_key_ts),
             block_cache,
             id,
             bloom: Some(bloom_filter),

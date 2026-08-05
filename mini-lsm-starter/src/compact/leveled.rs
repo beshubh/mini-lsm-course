@@ -63,8 +63,8 @@ impl LeveledCompactionController {
         let max_key = sst_tables.iter().map(|sst| sst.last_key()).max().unwrap();
         let range = overlapping_sst_range(
             &level_sstables,
-            Bound::Included(min_key.raw_ref()),
-            Bound::Included(max_key.raw_ref()),
+            Bound::Included(min_key.key_ref()),
+            Bound::Included(max_key.key_ref()),
         );
 
         level_sstables[range]

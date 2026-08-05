@@ -24,8 +24,8 @@ use super::Block;
 /// ┌──────────────────────────────────────────────────────────────┐
 /// │                        Key-Value Entries                     │
 /// │                                                              │
-/// │  Entry 0: overlap_len | rest_len | rest_key | value_len | value          │
-/// │  Entry 1: overlap_len | rest_len | rest_key | value_len | value          │
+/// │  Entry 0: overlap_len | rest_len | rest_key | timestamp(u64)| value_len | value          │
+/// │  Entry 1: overlap_len | rest_len | rest_key | timestamp(u64)| value_len | value          │
 /// │  ...                                                         │
 /// │                                                              │
 /// ├──────────────────────────────────────────────────────────────┤
@@ -41,8 +41,8 @@ use super::Block;
 ///
 /// ```text
 /// ┌─────────┬─────────┬──────────────┬──────────┬──────────────────┐
-/// │ overlap │ rest len│ rest key     │ valuelen │ value content    │
-/// │ (u16)   │ (u16)   │ rest_len B   │ (u16)    │ valuelen bytes   │
+/// │ overlap │ rest len│ rest key  |ts     │ valuelen │ value content    │
+/// │ (u16)   │ (u16)   │ rest_len B|(u64)  │ (u16)    │ valuelen bytes   │
 /// └─────────┴─────────┴──────────────┴──────────┴──────────────────┘
 /// ```
 /// Iterates on a block.
@@ -70,7 +70,11 @@ impl BlockIterator {
             pos += 2;
             let rest_key_len = u16::from_be_bytes([block.data[pos], block.data[pos + 1]]) as usize;
             pos += 2;
-            KeyVec::from_vec(block.data[pos..pos + rest_key_len].to_vec())
+            let key_bytes = block.data[pos..pos + rest_key_len].to_vec();
+            pos += rest_key_len;
+            let timestamp = u64::from_be_bytes(block.data[pos..pos + 8].try_into().unwrap());
+            let key = KeyVec::from_vec_with_ts(key_bytes, timestamp);
+            key
         };
 
         Self {
@@ -96,10 +100,12 @@ impl BlockIterator {
         let rest_key_len =
             u16::from_be_bytes([self.block.data[pos], self.block.data[pos + 1]]) as usize;
         pos += 2;
-
-        let mut key = KeyVec::from_vec(self.first_key.raw_ref()[..overlap_len].to_vec());
-        key.append(&self.block.data[pos..pos + rest_key_len]);
+        let mut key_bytes = self.first_key.key_ref()[..overlap_len].to_vec();
+        key_bytes.extend_from_slice(&self.block.data[pos..pos + rest_key_len]);
         pos += rest_key_len;
+        let timestamp = u64::from_be_bytes(self.block.data[pos..pos + 8].try_into().unwrap());
+        let key = KeyVec::from_vec_with_ts(key_bytes, timestamp);
+        pos += 8;
         (key, pos)
     }
 

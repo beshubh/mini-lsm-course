@@ -25,7 +25,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 pub use builder::SsTableBuilder;
-use bytes::Bytes;
 use bytes::{Buf, BufMut};
 pub use iterator::SsTableIterator;
 
@@ -51,14 +50,14 @@ impl BlockMeta {
     /// ASCII layout of the encoded `BlockMeta` section:
     ///
     /// ```text
-    /// +-------------------------------------------------------------------------------+
-    /// |                           num_block_metas (u32)                               |
-    /// +-------------------------------------------------------------------------------+
-    /// +--------------------------- repeated for each block ---------------------------+
-    /// | offset (u32) | first_key_len (u16) | first_key | last_key_len (u16) | last_key |
-    /// +-------------------------------------------------------------------------------+
-    /// |                           ... repeated `block_meta.len()` times ...           |
-    /// +-------------------------------------------------------------------------------+
+    /// +-----------------------------------------------------------------------------------------------------------------+
+    /// |                           num_block_metas (u32)                                                                 |
+    /// +-----------------------------------------------------------------------------------------------------------------+
+    /// +--------------------------- repeated for each block -------------------------------------------------------------+
+    /// | offset (u32) | first_key_len (u16) | first_key | timestamp(u64)| last_key_len (u16) | last_key | timestamp(u64) |
+    /// +-----------------------------------------------------------------------------------------------------------------+
+    /// |                           ... repeated `block_meta.len()` times ...                                             |
+    /// +-----------------------------------------------------------------------------------------------------------------+
     /// ```
     ///
     /// All integer fields are encoded in big-endian order.
@@ -69,10 +68,12 @@ impl BlockMeta {
         buf.put_u32(block_meta.len().try_into().unwrap());
         for bm in block_meta {
             buf.put_u32(bm.offset as u32);
-            buf.put_u16(bm.first_key.len().try_into().unwrap());
-            buf.put_slice(bm.first_key.raw_ref());
-            buf.put_u16(bm.last_key.len().try_into().unwrap());
-            buf.put_slice(bm.last_key.raw_ref());
+            buf.put_u16(bm.first_key.key_len().try_into().unwrap());
+            buf.put_slice(bm.first_key.key_ref());
+            buf.put_u64(bm.first_key.ts());
+            buf.put_u16(bm.last_key.key_len().try_into().unwrap());
+            buf.put_slice(bm.last_key.key_ref());
+            buf.put_u64(bm.last_key.ts());
         }
         let checksum = crc32fast::hash(&buf[bm_starting_offset..]);
         buf.put_u32(checksum);
@@ -112,8 +113,9 @@ impl BlockMeta {
                 buf.remaining() >= first_key_len,
                 "first key length exceeds remaining buffer"
             );
-            let first_key = buf.copy_to_bytes(first_key_len).to_vec();
-
+            let first_key = buf.copy_to_bytes(first_key_len);
+            assert!(buf.remaining() >= 8, "not enough bytes for timestamp");
+            let first_key_ts = buf.get_u64();
             assert!(buf.remaining() >= 2, "missing last key length");
             let last_key_len = buf.get_u16() as usize;
 
@@ -121,11 +123,13 @@ impl BlockMeta {
                 buf.remaining() >= last_key_len,
                 "last key length exceeds remaining buffer"
             );
-            let last_key = buf.copy_to_bytes(last_key_len).to_vec();
+            let last_key = buf.copy_to_bytes(last_key_len);
+            assert!(buf.remaining() >= 8, "not enough bytes for timestamp");
+            let last_key_ts = buf.get_u64();
             metas.push(BlockMeta {
                 offset: offset as usize,
-                first_key: KeyBytes::from_bytes(Bytes::from(first_key)),
-                last_key: KeyBytes::from_bytes(Bytes::from(last_key)),
+                first_key: KeyBytes::from_bytes_with_ts(first_key, first_key_ts),
+                last_key: KeyBytes::from_bytes_with_ts(last_key, last_key_ts),
             });
         }
         metas

@@ -95,14 +95,15 @@ impl BlockBuilder {
                 .count();
         }
 
-        let rest_key = &key.raw_ref()[overlap_len..];
+        let rest_key = &key.key_ref()[overlap_len..];
         // 2  overlap_len
         // 2  rest_key_len
         // N  rest_key
+        // 8 timestamp
         // 2  value_len
         // M  value
         if !self.is_empty()
-            && 2 + 2 + rest_key.len() + 2 + value.len() + self.data.len() >= self.block_size
+            && 4 + rest_key.len() + 8 + 2 + value.len() + self.data.len() >= self.block_size
         {
             return false;
         }
@@ -116,6 +117,7 @@ impl BlockBuilder {
         self.data.put_u16(overlap_len as u16);
         self.data.put_u16(rest_key_len);
         self.data.put_slice(rest_key);
+        self.data.put_u64(key.ts());
 
         let valuelen: u16 = value
             .len()
