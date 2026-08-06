@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use crate::iterators::StorageIterator;
-use crate::key::{KeyBytes, KeySlice};
+use crate::key::{KeyBytes, KeySlice, TS_DEFAULT};
 use crate::lsm_storage::BlockCache;
 use crate::table::{SsTable, SsTableBuilder};
 use crate::wal::Wal;
@@ -95,22 +95,32 @@ impl MemTable {
         })
     }
 
-    pub fn for_testing_put_slice(&self, key: KeySlice, value: &[u8]) -> Result<()> {
-        self.put(key, value)
+    pub fn for_testing_put_slice(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put(KeySlice::from_slice(key, TS_DEFAULT), value)
     }
 
-    pub fn for_testing_get_slice(&self, key: KeySlice) -> Option<Bytes> {
-        self.get(key)
+    pub fn for_testing_get_slice(&self, key: &[u8]) -> Option<Bytes> {
+        self.get(KeySlice::from_slice(key, TS_DEFAULT))
     }
 
     pub fn for_testing_scan_slice(
         &self,
-        lower: Bound<KeySlice>,
-        upper: Bound<KeySlice>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
     ) -> MemTableIterator {
         // This function is only used in week 1 tests, so during the week 3 key-ts refactor, you do
         // not need to consider the bound exclude/include logic. Simply provide `DEFAULT_TS` as the
         // timestamp for the key-ts pair.
+        let lower = match lower {
+            Bound::Included(key) => Bound::Included(KeySlice::from_slice(key, TS_DEFAULT)),
+            Bound::Excluded(key) => Bound::Excluded(KeySlice::from_slice(key, TS_DEFAULT)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let upper = match upper {
+            Bound::Included(key) => Bound::Included(KeySlice::from_slice(key, TS_DEFAULT)),
+            Bound::Excluded(key) => Bound::Excluded(KeySlice::from_slice(key, TS_DEFAULT)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
         self.scan(lower, upper)
     }
 

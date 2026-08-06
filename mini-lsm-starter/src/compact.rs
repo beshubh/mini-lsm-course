@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
 use serde::{Deserialize, Serialize};
 pub use simple_leveled::{
@@ -147,14 +148,19 @@ impl LsmStorageInner {
         let mut sst_builder = SsTableBuilder::new(self.options.block_size);
         let mut new_sstables = vec![];
         while iter.is_valid() {
-            if iter.value().is_empty() && compact_to_bottom_level {
+            // NOTE: task 3 of week 3 day 2, requires i am not sure why.
+            // if iter.value().is_empty() && compact_to_bottom_level {
+            //     iter.next()
+            //         .context("compaction_and_generate: failed to advance while compaction")?;
+            //     continue;
+            // }
+            let user_key = Bytes::copy_from_slice(iter.key().key_ref());
+            while iter.is_valid() && iter.key().key_ref() == user_key {
+                sst_builder.add(iter.key(), iter.value());
                 iter.next()
                     .context("compaction_and_generate: failed to advance while compaction")?;
-                continue;
             }
-            sst_builder.add(iter.key(), iter.value());
-            iter.next()
-                .context("compaction_and_generate: failed to advance while compaction")?;
+
             // when SST gets too big we split it.
             if sst_builder.estimated_size() >= self.options.target_sst_size {
                 let new_sst_id = self.next_sst_id();

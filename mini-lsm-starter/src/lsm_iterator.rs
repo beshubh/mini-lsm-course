@@ -65,7 +65,10 @@ impl LsmIterator {
 
     fn skip_tombstones(&mut self) -> Result<()> {
         while self.inner.is_valid() && self.inner.value().is_empty() {
-            self.inner.next()?
+            let user_key = self.inner.key().key_ref().to_vec();
+            while self.inner.is_valid() && user_key.as_slice() == self.inner.key().key_ref() {
+                self.inner.next()?;
+            }
         }
         Ok(())
     }
@@ -90,7 +93,15 @@ impl StorageIterator for LsmIterator {
         if self.stopped {
             return Ok(());
         }
+        let prev_key = self.inner.key().key_ref().to_vec();
+        let prev_value = self.inner.value().to_vec();
         self.inner.next()?;
+
+        // skip all the older versions of the key, if we have returned the newer version.
+        while self.inner.is_valid() && self.inner.key().key_ref() == prev_key.as_slice() {
+            self.inner.next()?;
+        }
+
         self.skip_tombstones()?;
         if self.is_valid() && is_past_upper_bound(&self.end_bound, self.key()) {
             self.stopped = true

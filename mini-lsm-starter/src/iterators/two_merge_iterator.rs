@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use anyhow::Result;
 
 use super::StorageIterator;
@@ -24,7 +21,6 @@ use super::StorageIterator;
 pub struct TwoMergeIterator<A: StorageIterator, B: StorageIterator> {
     a: A,
     b: B,
-    // Add fields as need
     current_a: bool,
     both_invalid: bool,
 }
@@ -35,6 +31,7 @@ impl<
 > TwoMergeIterator<A, B>
 {
     pub fn create(a: A, b: B) -> Result<Self> {
+        let both_invalid = !a.is_valid() && !b.is_valid();
         let mut current_a = false;
         if a.is_valid() && b.is_valid() {
             if a.key() <= b.key() {
@@ -47,7 +44,7 @@ impl<
             a,
             b,
             current_a,
-            both_invalid: false,
+            both_invalid,
         })
     }
 }
@@ -88,16 +85,12 @@ impl<
 
     fn next(&mut self) -> Result<()> {
         if self.current_a {
-            self.a.next()?;
-            // skip all the elments from b that are less than a
-            while self.a.is_valid() && self.b.is_valid() && self.a.key() >= self.b.key() {
+            if self.a.is_valid() && self.b.is_valid() && self.a.key() == self.b.key() {
                 self.b.next()?;
             }
+            self.a.next()?;
         } else {
             self.b.next()?;
-            while self.b.is_valid() && self.a.is_valid() && self.b.key() > self.a.key() {
-                self.a.next()?;
-            }
         }
 
         if !self.a.is_valid() && !self.b.is_valid() {
