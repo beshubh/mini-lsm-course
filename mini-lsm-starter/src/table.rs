@@ -58,12 +58,14 @@ impl BlockMeta {
     /// +-----------------------------------------------------------------------------------------------------------------+
     /// |                           ... repeated `block_meta.len()` times ...                                             |
     /// +-----------------------------------------------------------------------------------------------------------------+
+    /// |                               largest_timestamp(u64)                                                            |
+    /// +-----------------------------------------------------------------------------------------------------------------+
     /// ```
     ///
     /// All integer fields are encoded in big-endian order.
     /// You may add extra fields to the buffer,
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
-    pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>) {
+    pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>, largest_ts: u64) {
         let bm_starting_offset = buf.len();
         buf.put_u32(block_meta.len().try_into().unwrap());
         for bm in block_meta {
@@ -75,12 +77,13 @@ impl BlockMeta {
             buf.put_slice(bm.last_key.key_ref());
             buf.put_u64(bm.last_key.ts());
         }
+        buf.put_u64(largest_ts);
         let checksum = crc32fast::hash(&buf[bm_starting_offset..]);
         buf.put_u32(checksum);
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(mut buf: impl Buf) -> Vec<BlockMeta> {
+    pub fn decode_block_meta(mut buf: impl Buf) -> (Vec<BlockMeta>, u64) {
         assert!(
             buf.remaining() >= 4,
             "block meta buffer too small to contain metadata count"
@@ -100,8 +103,13 @@ impl BlockMeta {
                 expected, actual
             )
         }
-
-        let mut buf = payload;
+        let (buf, largest_ts_bytes) = payload.split_at(payload.len() - 8);
+        let largest_ts = u64::from_be_bytes(
+            largest_ts_bytes
+                .try_into()
+                .expect("blockmeta decode: largest ts bytes should of 8 bytes"),
+        );
+        let mut buf = buf;
         let num_block_metas = buf.get_u32() as usize;
         let mut metas = Vec::with_capacity(num_block_metas);
         for _ in 0..num_block_metas {
@@ -132,7 +140,7 @@ impl BlockMeta {
                 last_key: KeyBytes::from_bytes_with_ts(last_key, last_key_ts),
             });
         }
-        metas
+        (metas, largest_ts)
     }
 }
 
@@ -233,7 +241,7 @@ impl SsTable {
 
         let meta_bytes = file.read(block_meta_offset as u64, meta_bytes_length as u64)?;
 
-        let block_meta = BlockMeta::decode_block_meta(&meta_bytes[..]);
+        let (block_meta, largest_ts) = BlockMeta::decode_block_meta(&meta_bytes[..]);
         let Some(first_meta) = block_meta.first() else {
             bail!("sst file does not contain any block metadata");
         };
@@ -257,7 +265,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom: Some(bloom_filter),
-            max_ts: 0,
+            max_ts: largest_ts,
         })
     }
 

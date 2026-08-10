@@ -40,6 +40,7 @@ pub struct SsTableBuilder {
     last_key: Vec<u8>,
     last_key_ts: u64,
     data: Vec<u8>,
+    largest_ts: u64,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
 
@@ -53,6 +54,7 @@ impl SsTableBuilder {
             builder: BlockBuilder::new(block_size),
             first_key: vec![],
             first_key_ts: 0,
+            largest_ts: 0,
             last_key: vec![],
             last_key_ts: 0,
             data: vec![],
@@ -75,6 +77,7 @@ impl SsTableBuilder {
             self.first_key = key.to_key_vec().into_inner();
             self.first_key_ts = key.ts();
         }
+        self.largest_ts = self.largest_ts.max(key.ts());
         if !self.builder.add(key, value) {
             self.finish_block();
             assert!(
@@ -114,7 +117,6 @@ impl SsTableBuilder {
         let encoded_block = curr_block.encode();
         let checksum = crc32fast::hash(&encoded_block);
         self.data.extend_from_slice(&encoded_block);
-        // TODO: put the checksum of the block after
         self.data.put_u32(checksum);
         self.meta.push(block_meta);
     }
@@ -146,14 +148,12 @@ impl SsTableBuilder {
         let bloom_filter = Bloom::build_from_key_hashes(&self.key_hashes, bits_per_key);
 
         // encode block meta
-        BlockMeta::encode_block_meta(&self.meta, &mut self.data);
-        // TODO: add checksum for the block meta section
+        BlockMeta::encode_block_meta(&self.meta, &mut self.data, self.largest_ts);
         self.data.put_u32(meta_offset.try_into().unwrap());
 
         // encode bloom filter
         let bloom_offset = self.data.len();
         bloom_filter.encode(&mut self.data);
-        // TODO: add checksum for bloom filter
         self.data.put_u32(bloom_offset.try_into().unwrap());
         // flush
         file.write_all(&self.data)?;
@@ -167,7 +167,7 @@ impl SsTableBuilder {
             block_cache,
             id,
             bloom: Some(bloom_filter),
-            max_ts: 0,
+            max_ts: self.largest_ts,
         })
     }
 
