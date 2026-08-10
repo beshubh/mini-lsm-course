@@ -428,7 +428,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: None,
             options: options.into(),
-            mvcc: Some(LsmMvccInner::new(0)),
+            mvcc: None,
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
         let manifest_path = path.join("MANIFEST");
@@ -436,6 +436,7 @@ impl LsmStorageInner {
             let s = storage.state.read();
             s.clone()
         };
+        let mut largest_ts = 0u64;
         match manifest_path.exists() {
             true => {
                 let (mf, records) =
@@ -473,6 +474,26 @@ impl LsmStorageInner {
                 }
                 // apply memtable to the state
                 new_state.memtable = memtable;
+                largest_ts = largest_ts.max(
+                    new_state
+                        .sstables
+                        .iter()
+                        .map(|(_, sst)| sst.max_ts())
+                        .max()
+                        .unwrap_or(0),
+                );
+                for memtable in &new_state.imm_memtables {
+                    let mut iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
+                    let mut max_ts = 0;
+                    while iter.is_valid() {
+                        max_ts = max_ts.max(iter.key().ts());
+                        iter.next().context(
+                            "StorageInner: open(), immutable memtable scan iter, next()",
+                        )?;
+                    }
+                    largest_ts = largest_ts.max(max_ts);
+                }
+                storage.mvcc = Some(LsmMvccInner::new(largest_ts));
                 let mut state_guard = storage.state.write();
                 *state_guard = Arc::new(new_state);
                 storage.manifest = Some(mf);
@@ -496,6 +517,7 @@ impl LsmStorageInner {
                 let mut new_state = (**state_guard).clone();
                 new_state.memtable = memtable;
                 *state_guard = Arc::new(new_state);
+                storage.mvcc = Some(LsmMvccInner::new(0));
                 storage.manifest = Some(mf)
             }
         };
