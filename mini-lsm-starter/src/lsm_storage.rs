@@ -18,6 +18,7 @@
 use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::key::{KeySlice, TS_RANGE_BEGIN, TS_RANGE_END};
+use crate::mvcc::txn::{Transaction, TxnIterator};
 use std::cmp::max;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
@@ -230,7 +231,7 @@ impl MiniLsm {
         }))
     }
 
-    pub fn new_txn(&self) -> Result<()> {
+    pub fn new_txn(&self) -> Result<Arc<Transaction>> {
         self.inner.new_txn()
     }
 
@@ -259,11 +260,7 @@ impl MiniLsm {
         self.inner.sync()
     }
 
-    pub fn scan(
-        &self,
-        lower: Bound<&[u8]>,
-        upper: Bound<&[u8]>,
-    ) -> Result<FusedIterator<LsmIterator>> {
+    pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
         self.inner.scan(lower, upper)
     }
 
@@ -515,13 +512,12 @@ impl LsmStorageInner {
         compaction_filters.push(compaction_filter);
     }
 
-    /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+    pub fn get_with_ts(&self, key: &[u8], read_ts: u64) -> Result<Option<Bytes>> {
         let state = {
             let guard = self.state.read();
             Arc::clone(&guard)
         };
-        let key = KeySlice::from_slice(key, TS_RANGE_BEGIN);
+        let key = KeySlice::from_slice(key, read_ts);
         let memtable_iter = state.memtable.scan(Bound::Included(key), Bound::Unbounded);
         // Scan frozen memtables
         let mut memtable_iters = vec![Box::new(memtable_iter)];
@@ -564,6 +560,12 @@ impl LsmStorageInner {
         }
 
         Ok(None)
+    }
+
+    /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
+    pub fn get(self: &Arc<Self>, key: &[u8]) -> Result<Option<Bytes>> {
+        let txn = self.mvcc().new_txn(self.clone(), self.options.serializable);
+        txn.get(key)
     }
 
     fn get_from_levels(
@@ -771,9 +773,8 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    pub fn new_txn(&self) -> Result<()> {
-        // no-op
-        Ok(())
+    pub fn new_txn(self: &Arc<Self>) -> Result<Arc<Transaction>> {
+        Ok(self.mvcc().new_txn(self.clone(), self.options.serializable))
     }
 
     fn create_l0sst_iters(
@@ -881,10 +882,11 @@ impl LsmStorageInner {
     }
 
     /// Create an iterator over a range of keys.
-    pub fn scan(
-        &self,
+    pub fn scan_with_ts(
+        self: &Arc<Self>,
         user_lower: Bound<&[u8]>,
         user_upper: Bound<&[u8]>,
+        read_ts: u64,
     ) -> Result<FusedIterator<LsmIterator>> {
         let snapshot = {
             let guard = self.state.read();
@@ -933,7 +935,16 @@ impl LsmStorageInner {
         let level_merge_iter = MergeIterator::create(level_iters);
         let inner = TwoMergeIterator::create(mem_iters_and_l0_sst_iters, level_merge_iter)?;
 
-        let iter = LsmIterator::new(inner, map_user_bound(user_upper))?;
+        let iter = LsmIterator::new(inner, map_user_bound(user_upper), read_ts)?;
         Ok(FusedIterator::new(iter))
+    }
+
+    pub fn scan(
+        self: &Arc<Self>,
+        user_lower: Bound<&[u8]>,
+        user_upper: Bound<&[u8]>,
+    ) -> Result<TxnIterator> {
+        let txn = self.mvcc().new_txn(self.clone(), self.options.serializable);
+        txn.scan(user_lower, user_upper)
     }
 }

@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use bytes::Bytes;
 use std::ops::Bound;
 
@@ -46,31 +43,47 @@ type LsmIteratorInner = TwoMergeIterator<
 pub struct LsmIterator {
     inner: LsmIteratorInner,
     end_bound: Bound<Bytes>,
+    read_ts: u64,
     stopped: bool,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
+    pub(crate) fn new(
+        iter: LsmIteratorInner,
+        end_bound: Bound<Bytes>,
+        read_ts: u64,
+    ) -> Result<Self> {
         let mut obj = Self {
             inner: iter,
             end_bound: end_bound.clone(),
+            read_ts,
             stopped: false,
         };
-        obj.skip_tombstones()?;
+        obj.advance_to_visible_key()?;
         if obj.is_valid() && is_past_upper_bound(&end_bound, obj.key()) {
             obj.stopped = true;
         }
         Ok(obj)
     }
 
-    fn skip_tombstones(&mut self) -> Result<()> {
-        while self.inner.is_valid() && self.inner.value().is_empty() {
+    fn advance_to_visible_key(&mut self) -> Result<()> {
+        loop {
+            // Versions newer than the snapshot are invisible, but an older version of the same
+            // user key may still be visible.
+            while self.inner.is_valid() && self.inner.key().ts() > self.read_ts {
+                self.inner.next()?;
+            }
+
+            if !self.inner.is_valid() || !self.inner.value().is_empty() {
+                return Ok(());
+            }
+
+            // A visible tombstone shadows every older version of this user key.
             let user_key = self.inner.key().key_ref().to_vec();
             while self.inner.is_valid() && user_key.as_slice() == self.inner.key().key_ref() {
                 self.inner.next()?;
             }
         }
-        Ok(())
     }
 }
 
@@ -94,15 +107,14 @@ impl StorageIterator for LsmIterator {
             return Ok(());
         }
         let prev_key = self.inner.key().key_ref().to_vec();
-        let prev_value = self.inner.value().to_vec();
         self.inner.next()?;
 
-        // skip all the older versions of the key, if we have returned the newer version.
+        // The visible version has been returned, so discard the remaining older versions.
         while self.inner.is_valid() && self.inner.key().key_ref() == prev_key.as_slice() {
             self.inner.next()?;
         }
 
-        self.skip_tombstones()?;
+        self.advance_to_visible_key()?;
         if self.is_valid() && is_past_upper_bound(&self.end_bound, self.key()) {
             self.stopped = true
         }
