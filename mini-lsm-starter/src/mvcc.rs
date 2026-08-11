@@ -66,7 +66,13 @@ impl LsmMvccInner {
     }
 
     pub fn new_txn(&self, inner: Arc<LsmStorageInner>, serializable: bool) -> Arc<Transaction> {
-        let read_ts = self.latest_commit_ts();
+        let read_ts = {
+            let mut guard = self.ts.lock();
+            let read_ts = guard.0;
+            guard.1.add_reader(read_ts);
+            read_ts
+        };
+
         let key_hashes = if serializable {
             Some(Mutex::new((HashSet::new(), HashSet::new())))
         } else {

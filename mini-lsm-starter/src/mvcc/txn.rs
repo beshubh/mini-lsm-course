@@ -66,7 +66,12 @@ impl Transaction {
 }
 
 impl Drop for Transaction {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        // we register a new reader on new_txn of LsmMvccInner::new_txn and remove it here
+        // as TxnIterator owns the transaction, when the transaction goes out of scope
+        // drop will be called and thus reader can be removed.
+        self.inner.mvcc().ts.lock().1.remove_reader(self.read_ts);
+    }
 }
 
 type SkipMapRangeIter<'a> =
