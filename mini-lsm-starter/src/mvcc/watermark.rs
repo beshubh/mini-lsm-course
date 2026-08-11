@@ -15,7 +15,10 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::collections::BTreeMap;
+use std::collections::{
+    BTreeMap,
+    btree_map::Entry::{Occupied, Vacant},
+};
 
 pub struct Watermark {
     readers: BTreeMap<u64, usize>,
@@ -34,15 +37,34 @@ impl Watermark {
         }
     }
 
-    pub fn add_reader(&mut self, ts: u64) {}
+    pub fn add_reader(&mut self, ts: u64) {
+        match self.readers.entry(ts) {
+            Vacant(entry) => {
+                entry.insert(1);
+            }
+            Occupied(mut entry) => {
+                *entry.get_mut() += 1;
+            }
+        }
+    }
 
-    pub fn remove_reader(&mut self, ts: u64) {}
+    pub fn remove_reader(&mut self, ts: u64) {
+        match self.readers.entry(ts) {
+            Vacant(entry) => {}
+            Occupied(mut entry) => {
+                *entry.get_mut() -= 1;
+                if *entry.get() == 0 {
+                    self.readers.remove(&ts);
+                }
+            }
+        }
+    }
 
     pub fn num_retained_snapshots(&self) -> usize {
         self.readers.len()
     }
 
     pub fn watermark(&self) -> Option<u64> {
-        Some(0)
+        self.readers.keys().next().cloned()
     }
 }
