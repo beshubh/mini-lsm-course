@@ -147,18 +147,40 @@ impl LsmStorageInner {
     {
         let mut sst_builder = SsTableBuilder::new(self.options.block_size);
         let mut new_sstables = vec![];
+        let watermark = self.mvcc().watermark();
         while iter.is_valid() {
-            // NOTE: task 3 of week 3 day 2, requires i am not sure why.
-            // if iter.value().is_empty() && compact_to_bottom_level {
-            //     iter.next()
-            //         .context("compaction_and_generate: failed to advance while compaction")?;
-            //     continue;
-            // }
             let user_key = Bytes::copy_from_slice(iter.key().key_ref());
-            while iter.is_valid() && iter.key().key_ref() == user_key {
+
+            // all the keys below or equal to watermark can be compacted.
+            // we just need to be keep the latest version of them
+            // watermark = 3
+            // a@4, a@3, a@2, a@1
+            //       ^
+            while iter.is_valid() && iter.key().ts() > watermark && iter.key().key_ref() == user_key
+            {
                 sst_builder.add(iter.key(), iter.value());
-                iter.next()
-                    .context("compaction_and_generate: failed to advance while compaction")?;
+                iter.next()?;
+            }
+
+            // if latest value at or below watermark is tombstone and compaction is bottom level, just skip every version of key
+            if iter.is_valid()
+                && iter.key().key_ref() == user_key
+                && iter.value().is_empty()
+                && compact_to_bottom_level
+            {
+                while iter.is_valid() && iter.key().key_ref() == user_key {
+                    iter.next()?;
+                }
+            } else {
+                // keep the latest version and drop rest
+                if iter.is_valid() && iter.key().key_ref() == user_key {
+                    sst_builder.add(iter.key(), iter.value());
+                    iter.next()?;
+                }
+
+                while iter.is_valid() && iter.key().key_ref() == user_key {
+                    iter.next()?;
+                }
             }
 
             // when SST gets too big we split it.
