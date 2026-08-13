@@ -86,12 +86,9 @@ impl Wal {
             let mut key_value_pairs = vec![];
             while cursor < body.len() {
                 let keylen = u16::from_be_bytes(body[cursor..(cursor + 2)].try_into().unwrap());
-                cursor += 2 as usize;
+                cursor += 2_usize;
 
-                let key: Vec<_> = body[cursor..(cursor + keylen as usize)]
-                    .iter()
-                    .cloned()
-                    .collect();
+                let key: Vec<_> = body[cursor..(cursor + keylen as usize)].to_vec();
                 cursor += keylen as usize;
                 let key_ts = u64::from_be_bytes(body[cursor..(cursor + 8)].try_into().unwrap());
                 cursor += 8;
@@ -99,7 +96,7 @@ impl Wal {
                 let valuelen =
                     u16::from_be_bytes(body[cursor..(cursor + 2)].try_into().unwrap()) as usize;
                 cursor += 2;
-                let value: Vec<_> = body[cursor..(cursor + valuelen)].iter().cloned().collect();
+                let value: Vec<_> = body[cursor..(cursor + valuelen)].to_vec();
                 cursor += valuelen;
                 key_value_pairs.push(((key, key_ts), value));
             }

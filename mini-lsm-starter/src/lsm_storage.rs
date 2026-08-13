@@ -477,8 +477,8 @@ impl LsmStorageInner {
                 largest_ts = largest_ts.max(
                     new_state
                         .sstables
-                        .iter()
-                        .map(|(_, sst)| sst.max_ts())
+                        .values()
+                        .map(|sst| sst.max_ts())
                         .max()
                         .unwrap_or(0),
                 );
@@ -554,7 +554,7 @@ impl LsmStorageInner {
             let Some(st) = ss_table else {
                 bail!("SsTable does not exist in LsmState, should be impossible!");
             };
-            let key_hash = farmhash::fingerprint32(key.key_ref());
+            let key_hash = farmhash::hash32(key.key_ref());
             if let Some(bloom) = &st.bloom
                 && bloom.may_contain(key_hash)
             {
@@ -620,7 +620,7 @@ impl LsmStorageInner {
             if key.key_ref() < st.first_key().key_ref() {
                 continue;
             }
-            let key_hash = farmhash::fingerprint32(key.key_ref());
+            let key_hash = farmhash::hash32(key.key_ref());
             if let Some(bloom) = &st.bloom
                 && !bloom.may_contain(key_hash)
             {
@@ -633,10 +633,10 @@ impl LsmStorageInner {
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+    pub fn write_batch_inner<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<u64> {
         // intentially crash if mvcc is not there
         let mvcc = self.mvcc();
-        let guard = mvcc.write_lock.lock();
+        let _guard = mvcc.write_lock.lock();
         let state = {
             let g = self.state.read();
             Arc::clone(&g)
@@ -657,12 +657,31 @@ impl LsmStorageInner {
         state.memtable.put_batch(&data)?;
         self.check_and_freeze_if_necessary(state)?;
         mvcc.update_commit_ts(commit_ts);
+        Ok(commit_ts)
+    }
+
+    pub fn write_batch<T: AsRef<[u8]>>(
+        self: &Arc<Self>,
+        batch: &[WriteBatchRecord<T>],
+    ) -> Result<()> {
+        if self.options.serializable {
+            let txn = self.new_txn()?;
+            for record in batch {
+                match record {
+                    WriteBatchRecord::Del(key) => txn.delete(key.as_ref()),
+                    WriteBatchRecord::Put(key, value) => txn.put(key.as_ref(), value.as_ref()),
+                }
+            }
+            txn.commit()?;
+        } else {
+            let commit_ts = self.write_batch_inner(batch)?;
+        }
 
         Ok(())
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn put(self: &Arc<Self>, key: &[u8], value: &[u8]) -> Result<()> {
         self.write_batch(&[WriteBatchRecord::Put(key, value)])
     }
 
@@ -685,7 +704,7 @@ impl LsmStorageInner {
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, key: &[u8]) -> Result<()> {
+    pub fn delete(self: &Arc<Self>, key: &[u8]) -> Result<()> {
         self.write_batch(&[WriteBatchRecord::Del(key)])
     }
 

@@ -73,8 +73,7 @@ impl BlockIterator {
             let key_bytes = block.data[pos..pos + rest_key_len].to_vec();
             pos += rest_key_len;
             let timestamp = u64::from_be_bytes(block.data[pos..pos + 8].try_into().unwrap());
-            let key = KeyVec::from_vec_with_ts(key_bytes, timestamp);
-            key
+            KeyVec::from_vec_with_ts(key_bytes, timestamp)
         };
 
         Self {

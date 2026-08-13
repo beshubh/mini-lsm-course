@@ -34,6 +34,7 @@ use crate::{
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
     lsm_storage::{LsmStorageInner, WriteBatchRecord, map_user_bound},
+    mvcc::CommittedTxnData,
 };
 
 pub struct Transaction {
@@ -47,6 +48,9 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        if let Some(key_hashes) = &self.key_hashes {
+            key_hashes.lock().1.insert(farmhash::hash32(key));
+        }
         if self.local_storage.contains_key(key) {
             let v = self.local_storage.get(key).unwrap();
             if v.value().is_empty() {
@@ -79,15 +83,47 @@ impl Transaction {
         let user_key = Bytes::copy_from_slice(key);
         let user_value = Bytes::copy_from_slice(value);
         self.local_storage.insert(user_key, user_value);
+        if let Some(kh) = &self.key_hashes {
+            kh.lock().0.insert(farmhash::hash32(key));
+        }
     }
 
     pub fn delete(&self, key: &[u8]) {
         self.put(key, &[]);
     }
 
+    fn validate_commit(&self) -> bool {
+        let transaction_range = self.read_ts + 1..self.inner.mvcc().latest_commit_ts() + 1;
+        let committed_txns = self.inner.mvcc().committed_txns.lock();
+        for (_, txn) in committed_txns.range(transaction_range) {
+            if txn.key_hashes.is_empty() {
+                continue;
+            }
+            if !self
+                .key_hashes
+                .as_ref()
+                .unwrap()
+                .lock()
+                .1
+                .is_disjoint(&txn.key_hashes)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn commit(&self) -> Result<()> {
-        if self.committed.load(Acquire) {
-            bail!("transaction already committed");
+        self.committed
+            .compare_exchange(false, true, SeqCst, SeqCst)
+            .map_err(|_| anyhow::anyhow!("transaction already committed"))?;
+        let guard = self.inner.mvcc().commit_lock.lock();
+        if let Some(kh) = &self.key_hashes
+            && !kh.lock().0.is_empty()
+            && self.inner.options.serializable
+            && !self.validate_commit()
+        {
+            bail!("transaction conflicts with other committed transactions")
         }
         let records = self
             .local_storage
@@ -100,10 +136,21 @@ impl Transaction {
                 }
             })
             .collect::<Vec<_>>();
-        self.inner
-            .write_batch(&records)
+        let commit_ts = self
+            .inner
+            .write_batch_inner(&records)
             .context("transaction::commit write batch")?;
-        self.committed.store(true, SeqCst);
+
+        if self.inner.options.serializable {
+            self.inner.mvcc().committed_txns.lock().insert(
+                commit_ts,
+                CommittedTxnData {
+                    read_ts: self.read_ts,
+                    key_hashes: self.key_hashes.as_ref().unwrap().lock().0.clone(),
+                    commit_ts: commit_ts,
+                },
+            );
+        }
         Ok(())
     }
 }
@@ -172,7 +219,16 @@ impl TxnIterator {
     ) -> Result<Self> {
         let mut obj = TxnIterator { _txn: txn, iter };
         obj.advance_to_visible_key()?;
+        obj.add_visible_key_to_readset();
         Ok(obj)
+    }
+
+    fn add_visible_key_to_readset(&mut self) {
+        if let Some(key_hashes) = &self._txn.key_hashes
+            && self.is_valid()
+        {
+            key_hashes.lock().1.insert(farmhash::hash32(self.key()));
+        }
     }
 
     fn advance_to_visible_key(&mut self) -> Result<()> {
@@ -211,7 +267,9 @@ impl StorageIterator for TxnIterator {
         self.iter
             .next()
             .context("TxnIterator next, failed to advance")?;
-        self.advance_to_visible_key()
+        self.advance_to_visible_key()?;
+        self.add_visible_key_to_readset();
+        Ok(())
     }
 
     fn num_active_iterators(&self) -> usize {
