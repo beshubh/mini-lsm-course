@@ -141,25 +141,26 @@ impl MemTable {
     /// In week 2, day 6, also flush the data to WAL.
     /// In week 3, day 5, modify the function to use the batch API.
     pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
-        let keylen = key.key_len();
-        let valuelen = value.len();
-        let k = KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(key.key_ref()), key.ts());
-        let v = Bytes::copy_from_slice(value);
-
-        if let Some(wal) = &self.wal {
-            wal.put(key, value).context("error persisting put to wal")?;
-        }
-        self.map.insert(k, v);
-        let size = keylen + valuelen;
-        self.approximate_size
-            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
-
-        Ok(())
+        self.put_batch(&[(key, value)])
     }
 
     /// Implement this in week 3, day 5; if you want to implement this earlier, use `&[u8]` as the key type.
-    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
-        unimplemented!()
+    pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        if let Some(wal) = &self.wal {
+            wal.put_batch(data)?;
+        }
+        data.iter().for_each(|item| {
+            let keylen = item.0.key_len();
+            let valuelen = item.1.len();
+            let k =
+                KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(item.0.key_ref()), item.0.ts());
+            let v = Bytes::copy_from_slice(item.1);
+            let size = keylen + valuelen;
+            self.approximate_size
+                .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            self.map.insert(k, v);
+        });
+        Ok(())
     }
 
     pub fn sync_wal(&self) -> Result<()> {

@@ -65,58 +65,60 @@ impl Wal {
             .open(&path)
             .context("wal recover: walfile does not exists")?;
         loop {
-            let mut keylen_buf = [0u8; 4];
+            let mut batch_len_buf = [0u8; 4];
             let bytes_read = file
-                .read(&mut keylen_buf)
+                .read(&mut batch_len_buf)
                 .context("reading payload length while recovering WAL")?;
             if bytes_read == 0 {
                 break;
             }
-            if bytes_read < keylen_buf.len() {
-                file.read_exact(&mut keylen_buf[bytes_read..])
-                    .context("truncated payload length in WAL")?;
+            if bytes_read < batch_len_buf.len() {
+                file.read_exact(&mut batch_len_buf[bytes_read..])
+                    .context("truncated body length in WAL")?;
             }
 
-            let keylen = u32::from_be_bytes(keylen_buf) as usize;
-            let mut key = vec![0u8; keylen];
-            file.read_exact(&mut key)
-                .context("walfile truncated reading key")?;
-            let mut ts_buf = [0u8; 8];
-            file.read_exact(&mut ts_buf)
-                .context("walfile truncated, reading key ts")?;
-            let key_ts = u64::from_be_bytes(ts_buf);
+            let batch_len = u32::from_be_bytes(batch_len_buf) as usize;
+            let mut body = vec![0u8; batch_len];
+            file.read_exact(&mut body)
+                .context("walfile truncated reading body")?;
 
-            let mut valuelen_buf = [0u8; 4];
-            file.read_exact(&mut valuelen_buf)
-                .context("walfile truncated reading value length")?;
-            let valuelen = u32::from_be_bytes(valuelen_buf) as usize;
-            let mut value = vec![0u8; valuelen];
-            file.read_exact(&mut value)
-                .context("walfile truncated reading value")?;
+            let mut cursor = 0usize;
+            let mut key_value_pairs = vec![];
+            while cursor < body.len() {
+                let keylen = u16::from_be_bytes(body[cursor..(cursor + 2)].try_into().unwrap());
+                cursor += 2 as usize;
 
+                let key: Vec<_> = body[cursor..(cursor + keylen as usize)]
+                    .iter()
+                    .cloned()
+                    .collect();
+                cursor += keylen as usize;
+                let key_ts = u64::from_be_bytes(body[cursor..(cursor + 8)].try_into().unwrap());
+                cursor += 8;
+
+                let valuelen =
+                    u16::from_be_bytes(body[cursor..(cursor + 2)].try_into().unwrap()) as usize;
+                cursor += 2;
+                let value: Vec<_> = body[cursor..(cursor + valuelen)].iter().cloned().collect();
+                cursor += valuelen;
+                key_value_pairs.push(((key, key_ts), value));
+            }
             let mut crc_buf = [0u8; 4];
             file.read_exact(&mut crc_buf)
                 .context("reading checksum while recovering WAL")?;
             let expected_crc = u32::from_be_bytes(crc_buf);
 
-            // `with_capacity` alone creates an empty vector, so there would be
-            // no bytes for `read_exact` to fill.
-            let length = 8 + key.len() + value.len();
-            let mut payload = Vec::with_capacity(length);
-            payload.extend_from_slice(&keylen_buf);
-            payload.extend_from_slice(&key);
-            payload.extend_from_slice(&ts_buf);
-            payload.extend_from_slice(&valuelen_buf);
-            payload.extend_from_slice(&value);
-
-            let actual_crc = crc32fast::hash(&payload);
+            let actual_crc = crc32fast::hash(&body);
             if actual_crc != expected_crc {
-                bail!("WAL record checksum failed");
+                bail!("wal record checksum failed");
             }
-
-            let key = KeyBytes::from_bytes_with_ts(Bytes::from(key), key_ts);
-            let value = Bytes::copy_from_slice(&value);
-            skiplist.insert(key, value);
+            key_value_pairs
+                .into_iter()
+                .for_each(|((key, key_ts), value)| {
+                    let key = KeyBytes::from_bytes_with_ts(Bytes::from(key), key_ts);
+                    let value = Bytes::from(value);
+                    skiplist.insert(key, value);
+                });
         }
         Ok(Wal {
             file: Arc::new(Mutex::new(BufWriter::new(file))),
@@ -125,24 +127,29 @@ impl Wal {
 
     pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
         // [[...bytes for payload] | [....]=crc]
-        let mut payload = vec![];
-        payload.put_u32(key.key_len() as u32);
-        payload.extend_from_slice(key.key_ref());
-        payload.put_u64(key.ts());
-        payload.put_u32(value.len() as u32);
-        payload.extend_from_slice(value);
-        let crc = crc32fast::hash(&payload);
-        payload.put_u32(crc);
-        self.file
-            .lock()
-            .write_all(&payload)
-            .context("unable to `put` to walfile")?;
-        Ok(())
+        self.put_batch(&[(key, value)])
     }
 
     /// Implement this in week 3, day 5; if you want to implement this earlier, use `&[u8]` as the key type.
-    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
-        unimplemented!()
+    pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        let mut buf = vec![];
+        for item in data {
+            buf.put_u16(item.0.key_len() as u16);
+            buf.extend_from_slice(item.0.key_ref());
+            buf.put_u64(item.0.ts());
+            buf.put_u16(item.1.len() as u16);
+            buf.extend_from_slice(item.1.as_ref());
+        }
+        let body_length = buf.len();
+        let checksum = Self::checksum(&buf);
+        let mut payload = vec![];
+        payload.put_u32(body_length as u32);
+        payload.extend_from_slice(&buf);
+        payload.put_u32(checksum);
+        self.file
+            .lock()
+            .write_all(&payload)
+            .context("wal `put_batch` failed to write to walfie")
     }
 
     pub fn sync(&self) -> Result<()> {

@@ -47,7 +47,7 @@ use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
-fn map_user_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
+pub fn map_user_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
     match bound {
         Bound::Included(key) => Bound::Included(Bytes::copy_from_slice(key)),
         Bound::Excluded(key) => Bound::Excluded(Bytes::copy_from_slice(key)),
@@ -634,36 +634,30 @@ impl LsmStorageInner {
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        // intentially crash if mvcc is not there
         let mvcc = self.mvcc();
         let guard = mvcc.write_lock.lock();
         let state = {
             let g = self.state.read();
             Arc::clone(&g)
         };
-        // intentially crash if mvcc is not there
         let commit_ts = mvcc.latest_commit_ts() + 1;
-        for record in batch {
-            match record {
-                WriteBatchRecord::Put(key, value) => {
-                    state
-                        .memtable
-                        .put(
-                            KeySlice::from_slice(key.as_ref(), commit_ts),
-                            value.as_ref(),
-                        )
-                        .with_context(|| {
-                            format!("write batch handling put failed, key: {:?}", key.as_ref())
-                        })?;
-                }
+        let data: Vec<(KeySlice, &[u8])> = batch
+            .iter()
+            .map(|item| match item {
+                WriteBatchRecord::Put(key, value) => (
+                    KeySlice::from_slice(key.as_ref(), commit_ts),
+                    value.as_ref(),
+                ),
                 WriteBatchRecord::Del(key) => {
-                    state
-                        .memtable
-                        .put(KeySlice::from_slice(key.as_ref(), commit_ts), &[])?; // TOMBSTONE
+                    (KeySlice::from_slice(key.as_ref(), commit_ts), &[] as &[u8])
                 }
-            }
-        }
+            })
+            .collect();
+        state.memtable.put_batch(&data)?;
         self.check_and_freeze_if_necessary(state)?;
         mvcc.update_commit_ts(commit_ts);
+
         Ok(())
     }
 
