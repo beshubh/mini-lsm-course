@@ -36,7 +36,7 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::KeySlice;
-use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::lsm_storage::{CompactionFilter, LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
@@ -148,6 +148,7 @@ impl LsmStorageInner {
         let mut sst_builder = SsTableBuilder::new(self.options.block_size);
         let mut new_sstables = vec![];
         let watermark = self.mvcc().watermark();
+        let filters = self.compaction_filters.lock().clone();
         while iter.is_valid() {
             let user_key = Bytes::copy_from_slice(iter.key().key_ref());
 
@@ -156,6 +157,7 @@ impl LsmStorageInner {
             // watermark = 3
             // a@4, a@3, a@2, a@1
             //       ^
+
             while iter.is_valid() && iter.key().ts() > watermark && iter.key().key_ref() == user_key
             {
                 sst_builder.add(iter.key(), iter.value());
@@ -173,6 +175,21 @@ impl LsmStorageInner {
                 }
             } else {
                 // keep the latest version and drop rest
+                for filter in &filters {
+                    match filter {
+                        CompactionFilter::Prefix(prefix_bytes) => {
+                            if iter.is_valid()
+                                && iter.key().key_ref() == user_key
+                                && iter.key().key_ref().starts_with(&prefix_bytes)
+                            {
+                                while iter.is_valid() && iter.key().key_ref() == &user_key {
+                                    iter.next()?;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
                 if iter.is_valid() && iter.key().key_ref() == user_key {
                     sst_builder.add(iter.key(), iter.value());
                     iter.next()?;
