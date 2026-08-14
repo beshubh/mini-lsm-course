@@ -113,6 +113,13 @@ impl Transaction {
         true
     }
 
+    fn remove_below_watermark_commits(&self) {
+        let watermark = self.inner.mvcc().watermark();
+        let mut guard = self.inner.mvcc().committed_txns.lock();
+        let new_commit_map = guard.split_off(&watermark);
+        *guard = new_commit_map;
+    }
+
     pub fn commit(&self) -> Result<()> {
         self.committed
             .compare_exchange(false, true, SeqCst, SeqCst)
@@ -140,7 +147,7 @@ impl Transaction {
             .inner
             .write_batch_inner(&records)
             .context("transaction::commit write batch")?;
-
+        self.remove_below_watermark_commits();
         if self.inner.options.serializable {
             self.inner.mvcc().committed_txns.lock().insert(
                 commit_ts,
